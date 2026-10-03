@@ -1,7 +1,7 @@
 # local-crawl's Docker engine: fastCRW's self-hosting stack, combined with the local
 # engine's real Chrome. Started and stopped by `crawl.ps1 -Engine docker`; first-time
-# image setup is `setup.ps1 -Docker`. Secrets come from docker/.env (created by
-# crawl.ps1, never committed).
+# image setup is `setup.ps1 -Docker`. SEARXNG_SECRET_KEY comes from docker/.env
+# (created by crawl.ps1, never committed).
 #
 # crw falls back through its tiers per request:
 #   plain HTTP -> Chrome-impersonating HTTP (real Chrome TLS fingerprint, no browser)
@@ -9,9 +9,9 @@
 #   -> Camoufox (anti-detect Firefox)
 # plus SearXNG for web search.
 #
-# Measured, the host's real Chrome beat both fastCRW browser options by a wide margin
-# (stealthcheck 92 vs 25 for browserless; LightPanda failed basic fingerprint checks),
-# so those two are optional extras: `docker compose --profile extras up -d`.
+# fastCRW's own browsers (browserless "stealth" Chromium and LightPanda) aren't used:
+# measured, the host's real Chrome beat both by a wide margin (stealthcheck 92 vs 25
+# for browserless; LightPanda failed basic fingerprint checks). See the README.
 name: local-crawl
 
 services:
@@ -82,52 +82,6 @@ services:
       timeout: 5s
       retries: 5
       start_period: 15s
-
-  # Optional extra: a fast, light JS renderer. Off by default: it failed basic
-  # fingerprint checks (sannysoft 25/30), so pages go to the real Chrome instead.
-  # To use it, start with `--profile extras` and add [renderer.lightpanda] to the config.
-  lightpanda:
-    image: lightpanda/browser:latest
-    profiles: ["extras"]
-    environment:
-      - LIGHTPANDA_DISABLE_TELEMETRY=true
-    command:
-      - "/bin/lightpanda"
-      - "serve"
-      - "--host"
-      - "0.0.0.0"
-      - "--port"
-      - "9222"
-      - "--log-level"
-      - "info"
-      - "--block-private-networks"
-      - "--block-cidrs"
-      - "0.0.0.0/8,10.0.0.0/8,127.0.0.0/8,169.254.0.0/16,172.16.0.0/12,192.168.0.0/16,100.64.0.0/10,224.0.0.0/4,240.0.0.0/4,192.0.0.0/24,192.0.2.0/24,198.18.0.0/15,198.51.100.0/24,203.0.113.0/24,fc00::/7,fe80::/10,fec0::/10,ff00::/8,::/96,64:ff9b:1::/48,2002::/16"
-    restart: unless-stopped
-    mem_limit: 1g
-    memswap_limit: 1g
-
-  # Optional extra: fastCRW's "stealth" Chromium (browserless, SSPL-3.0 licensed).
-  # Off by default: it scored far worse than the host's real Chrome (stealthcheck 25 vs
-  # 92, CreepJS 80% "stealth" lies detected). To use it instead, start with
-  # `--profile extras` and point CRW_RENDERER__CHROME__WS_URL at
-  # ws://chrome-stealth:3000/chromium?token=<BROWSERLESS_TOKEN>&stealth=true
-  # with chrome_backend = "browserless" in the config.
-  chrome-stealth:
-    image: ghcr.io/browserless/chromium:v2.27.0
-    profiles: ["extras"]
-    environment:
-      - TOKEN=${BROWSERLESS_TOKEN}
-      - CONCURRENT=15
-      - MAX_QUEUE_LENGTH=30
-      - TIMEOUT=60000
-      - EXIT_ON_HEALTH_FAILURE=true
-    shm_size: "2g"
-    restart: unless-stopped
-    mem_limit: 3g
-    memswap_limit: 3g
-    tmpfs:
-      - /tmp:size=512m
 
   # Camoufox: an anti-detect Firefox, used as the last fallback for pages that block
   # the Chrome-based tiers (e.g. a Cloudflare 403).

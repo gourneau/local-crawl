@@ -35,8 +35,8 @@ param(
     [switch]$Headed,
 
     # local:  crw-server.exe + your Chrome + the DevTools filter (the default).
-    # docker: fastCRW's Docker stack with every stealth tier (impersonated HTTP,
-    #         LightPanda, browserless stealth Chrome, Camoufox) plus SearXNG search.
+    # docker: fastCRW's Docker stack: Chrome-impersonating HTTP, Camoufox and SearXNG
+    #         search, rendering JS pages with the same Chrome and filter.
     #         Needs Docker Desktop and a one-time `.\setup.ps1 -Docker`.
     # Defaults to whichever engine is running (for restart), else local.
     [ValidateSet('local', 'docker')]
@@ -398,8 +398,7 @@ function Invoke-Docker {
     $out
 }
 
-# "--profile extras" makes stop and status also cover the optional containers.
-function Invoke-Compose { Invoke-Docker compose -f $ComposeFile --profile extras @args }
+function Invoke-Compose { Invoke-Docker compose -f $ComposeFile @args }
 
 function Test-DockerDaemon {
     if (-not (Get-Command docker -ErrorAction SilentlyContinue)) { return $false }
@@ -411,7 +410,7 @@ function Test-DockerDaemon {
 function Test-DockerEngineRunning {
     if (-not (Test-DockerDaemon)) { return $false }
     $ErrorActionPreference = 'Continue'
-    $ids = & docker compose -f $ComposeFile --profile extras ps -q 2>$null
+    $ids = & docker compose -f $ComposeFile ps -q 2>$null
     return [bool]$ids
 }
 
@@ -429,7 +428,7 @@ function Start-DockerDesktop {
     throw "Docker Desktop didn't become ready within 3 minutes."
 }
 
-# Random secrets for the browserless token and SearXNG, created once in docker\.env.
+# A random secret for SearXNG, created once in docker\.env.
 function Initialize-DockerEnv {
     $envFile = Join-Path $DockerDir '.env'
     if (Test-Path $envFile) { return }
@@ -440,9 +439,7 @@ function Initialize-DockerEnv {
         $rng.GetBytes($buf)
         -join ($buf | ForEach-Object { $_.ToString('x2') })
     }
-    Set-Content -Path $envFile -Encoding ascii -Value @(
-        "BROWSERLESS_TOKEN=$(& $hex 24)",
-        "SEARXNG_SECRET_KEY=$(& $hex 32)")
+    Set-Content -Path $envFile -Encoding ascii -Value "SEARXNG_SECRET_KEY=$(& $hex 32)"
 }
 
 function Start-DockerEngine {
@@ -465,7 +462,7 @@ function Start-DockerEngine {
         if ($realUa) { $env:CRW_USER_AGENT = $realUa }
 
         Write-Host "  starting containers..."
-        $null = Invoke-Docker compose -f $ComposeFile up -d --no-build
+        $null = Invoke-Compose up -d --no-build
         if (-not (Wait-Url "$ApiUrl/health" 120)) {
             throw "The Docker engine didn't become healthy within 2 minutes. See: docker compose -f docker\compose.yml logs crw"
         }

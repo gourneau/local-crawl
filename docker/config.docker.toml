@@ -1,5 +1,6 @@
 # crw settings for the Docker engine (crawl.ps1 -Engine docker). Based on fastCRW's
-# config.docker.toml and config.stealth.toml, with every stealth tier switched on.
+# config.docker.toml and config.stealth.toml. Fetch tiers: plain HTTP, Chrome-impersonating
+# HTTP, the host's real Chrome (through the DevTools filter), then Camoufox.
 # Full reference: https://docs.fastcrw.com/configuration/
 
 [server]
@@ -14,7 +15,6 @@ auto_extend_deadline_for_ladder = true
 mode = "auto"
 page_timeout_ms = 45000
 http_timeout_ms = 4000
-lightpanda_timeout_ms = 2500
 chrome_timeout_ms = 30000
 chrome_nav_budget_ms = 12000
 # Load images and fonts like a real visit (fastCRW's stealth config blocks them for speed).
@@ -27,7 +27,9 @@ chrome_backend = "vanilla"
 chrome_context_pool_enabled = false
 
 [renderer.lightpanda]
-# Off: send JS pages straight to the real Chrome (LightPanda failed basic fingerprint checks).
+# Meant to switch LightPanda off (it failed basic fingerprint checks), so JS pages go to
+# the real Chrome. crw 0.37.2 still tries the empty URL first: it fails fast (logged as
+# "CDP discovery failed", reported as a "lightpandaCrash" failover) and moves on to Chrome.
 ws_url = ""
 
 [renderer.camoufox]

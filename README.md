@@ -102,8 +102,6 @@ Network fingerprint ([tls.peet.ws](https://tls.peet.ws/api/all)):
 | `impersonated-http` (Docker engine) | `t13d1516h2_8daaf6152771_…` | `52d84b11…` | **yes** |
 | Chrome (both engines) | genuine | genuine | yes, it is Chrome |
 
-browserless and LightPanda are still in `docker\compose.yml` as optional `extras`.
-
 ## Requirements
 
 - Windows 10 or 11 (x64 or ARM64)

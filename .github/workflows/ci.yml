@@ -45,4 +45,4 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: docker compose config
-        run: docker compose -f docker/compose.yml --profile extras config --quiet
+        run: docker compose -f docker/compose.yml config --quiet
