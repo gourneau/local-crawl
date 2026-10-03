@@ -33,6 +33,7 @@ flowchart LR
 
 - `crawl.ps1` does all the work. The tray app is a small C# front end that calls it and polls the health endpoints.
 - Chrome runs with its own throwaway profile in `.chrome-profile\`, separate from your everyday browser. The scripts only ever stop the Chrome that uses that profile.
+- **Real identity:** the crawler presents the browser's real identity, such as Chrome 154 on Windows, in both the plain HTTP and browser modes. It also starts Chrome without the automation flag (`navigator.webdriver`). By default crw would claim to be a fixed older Chrome on a Mac.
 
 ## Requirements
 
@@ -128,6 +129,43 @@ Agents get these tools: `crw_scrape`, `crw_crawl`, `crw_check_crawl_status`, `cr
 
 If a client only supports stdio MCP, run `bin\crw-mcp.exe --api-url http://127.0.0.1:3002 --hide-credits` as the command.
 
+## Telling Claude to use it
+
+Claude has its own web fetch. You need to tell it to read pages with crw instead.
+
+**Why bother?** Claude's built-in fetch identifies itself as `Claude-User`, doesn't run JavaScript, and refuses some domains outright. crw looks like a normal Chrome browser. In one side-by-side test on bot-protected sites (Reddit, Zillow, Glassdoor, Amazon, NYT), the built-in fetch read 0 of 5 and crw read all 5.
+
+crw has no search tool, so let Claude keep its built-in web search for finding pages.
+
+**Minimal version.** One line is enough:
+
+```markdown
+To read web pages, use the crw MCP tools (`crw_scrape`; `crw_map`/`crw_crawl` for many pages) instead of the built-in web fetch. crw gets through sites that block the built-in fetcher. Keep using built-in web search to find pages.
+```
+
+**Fuller version,** with usage tips:
+
+```markdown
+## Web research
+
+Finding pages and reading pages use different tools:
+
+- **Finding pages:** use your built-in web search. crw has no search tool. Never use crw to load search-engine result pages (Google, Bing, DuckDuckGo, etc.).
+- **Reading pages:** use the crw MCP tools instead of the built-in web fetch. crw returns the full page as clean markdown and can render JavaScript.
+  - `crw_scrape` reads one URL. If the result is empty, missing content, or a short interstitial ("continue shopping", "verify you are human", "just a moment"), retry with `renderJs: true`. Output is cut at about 15,000 characters; raise `maxLength` only if you need the rest.
+  - `crw_map` lists a site's URLs without fetching them. Use it to pick pages, then scrape only those.
+  - `crw_crawl` fetches many pages from one site. It returns a job id; poll `crw_check_crawl_status` with it for the results. Keep `maxPages` at 20 or fewer unless I ask for more (the default is 10).
+- If the crw tools can't connect, say so, then use the built-in web fetch instead.
+```
+
+**Where to put it:**
+
+| App | Where |
+|---|---|
+| Claude Code | `~/.claude/CLAUDE.md` (macOS/Linux) or `%USERPROFILE%\.claude\CLAUDE.md` (Windows). Applies to every project. |
+| Claude Desktop | **Settings → Profile**, in the personal preferences box, or a Project's instructions. Also turn on web search in the chat's tools menu. |
+| Other agents | Their system prompt or rules file, such as Cursor rules or `AGENTS.md` |
+
 ## Sharing with your other devices (Tailscale)
 
 [Tailscale Serve](https://tailscale.com/kb/1312/serve) forwards traffic from your tailnet to the crawler. crw-server still only listens on `127.0.0.1`, so it isn't exposed to your LAN or the internet, and no firewall changes are needed.
@@ -207,6 +245,8 @@ crw's limit on *incoming* API requests is turned off (`rate_limit_rps = 0`). Its
 | Garbled characters (`Ã©`, `â€™`) in PowerShell | Windows PowerShell 5.1's `Invoke-RestMethod` decodes this API as Latin-1. Use `curl.exe`, PowerShell 7, or `.\crawl.ps1 scrape`. |
 | "Port 3002 is already used by …" | Another app has the port. Change `$ApiPort` at the top of `crawl.ps1`. |
 | Tray icon is amber while running | The browser was closed. Click **Restart**. |
+| A page comes back as a short "continue shopping" or "just a moment" page | That's a bot wall the plain HTTP fetch didn't get past. Retry with `"renderJs": true` (Amazon product pages often need this). |
+| A site blocks every request, even ones that used to work | Your IP has been flagged, often after many requests in a short time. Wait a while, then slow down. |
 | `/v1/search` returns 503 | Search needs a [SearXNG](https://docs.fastcrw.com/) backend, which isn't set up here. |
 | `json` / `summary` formats or `/v1/extract` fail | They need an LLM API key in `[extraction.llm]`. |
 

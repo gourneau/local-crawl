@@ -14,6 +14,10 @@ rate_limit_rps = 0
 mode = "auto"
 # Generous budget for a slow or jittery home connection (default 30000).
 page_timeout_ms = 45000
+# HTTP first, browser when needed (the default). Forcing every page through the
+# browser (render_js_default = true) tested worse: Cloudflare challenged the browser
+# on sites the plain fetch reads fine.
+# render_js_default = true
 pool_size = 4
 
 [mcp]

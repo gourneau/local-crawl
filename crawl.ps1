@@ -144,6 +144,16 @@ function Clear-ChromeCrashFlag {
     }
 }
 
+# The crawler browser's own User-Agent, minus the "Headless" marker, or $null if it isn't up.
+function Get-BrowserUserAgent {
+    try {
+        $info = Invoke-RestMethod "http://127.0.0.1:$CdpPort/json/version" -TimeoutSec 3
+        return ($info.'User-Agent' -replace 'HeadlessChrome', 'Chrome')
+    } catch {
+        return $null
+    }
+}
+
 # --- Commands -----------------------------------------------------------------
 function Start-Browser {
     if (Get-Browser) {
@@ -176,6 +186,8 @@ function Start-Browser {
         '--disable-extensions',
         '--disable-sync',
         '--disable-background-networking',
+        # No navigator.webdriver flag, also in workers, which crw's injected script can't reach.
+        '--disable-blink-features=AutomationControlled',
         'about:blank'
     )
     if ($Headed) {
@@ -184,7 +196,8 @@ function Start-Browser {
     } else {
         $mode = 'headless'
         $windowStyle = 'Hidden'
-        $browserArgs = @('--headless=new', '--disable-gpu') + $browserArgs
+        # The GPU stays on: software rendering is a well-known headless fingerprint.
+        $browserArgs = @('--headless=new') + $browserArgs
     }
     $null = Start-Process -FilePath $exe -ArgumentList $browserArgs -WindowStyle $windowStyle `
         -RedirectStandardError (Join-Path $LogDir 'browser.log') `
@@ -212,6 +225,11 @@ function Start-Crw {
     $env:CRW_SERVER__HOST = '127.0.0.1'
     $env:CRW_SERVER__PORT = "$ApiPort"
     $env:CRW_RENDERER__CHROME__WS_URL = "ws://127.0.0.1:$CdpPort/"
+
+    # crw presents a fixed "Chrome on Mac" User-Agent by default. Present the browser's
+    # real one instead, so the header matches what page scripts see about the machine.
+    $realUa = Get-BrowserUserAgent
+    if ($realUa) { $env:CRW_CRAWLER__USER_AGENT = $realUa }
     if (-not $env:RUST_LOG) { $env:RUST_LOG = 'info' }
 
     $proc = Start-Process -FilePath $CrwExe -WorkingDirectory $Root -WindowStyle Hidden -PassThru `
