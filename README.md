@@ -50,7 +50,11 @@ Out of the box, crw's browser has the same kind of telltale signs as Playwright 
 - WebGL reports the real GPU.
 - Chrome's client hints stay intact. crw's User-Agent override is dropped too, because it blanks them.
 
-**3. No automation tells over DevTools.** The filter also drops `Runtime.enable`. That's the best-known way pages detect Puppeteer and Playwright, and crw works fine without it. The filter logs every DevTools command crw sends to `logs\cdp-filter.log`, so you can audit it yourself.
+**3. No automation tells over DevTools.** The filter also drops two commands crw sends:
+- `Runtime.enable`, the best-known way pages detect Puppeteer and Playwright.
+- `Fetch.enable`, which makes Chrome pause every request for crw to approve, so pages load like a normal visit without it.
+
+crw works fine without both. The filter logs every DevTools command crw sends to `logs\cdp-filter.log`, so you can audit it yourself.
 
 crw's plain HTTP fetch, used before falling back to Chrome, sends the browser's real User-Agent rather than crw's default "Chrome 150 on a Mac".
 

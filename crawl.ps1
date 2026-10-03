@@ -52,9 +52,10 @@ $CdpPort    = 9223   # DevTools port crw connects to (the filter, or Chrome if t
 $ChromePort = 9224   # Chrome's own DevTools port, behind the filter
 
 # DevTools commands from crw that the filter answers itself instead of passing to Chrome
-# (comma-separated). Runtime.enable is a well-known automation giveaway, and crw works
-# without it. Override with $env:CRAWL_FILTER_DROP to experiment.
-$FilterDrop = 'Runtime.enable'
+# (comma-separated). Runtime.enable is a well-known automation giveaway; Fetch.enable
+# makes Chrome pause every request for crw to approve. crw works fine without either, and
+# pages then load like a normal visit. Override with $env:CRAWL_FILTER_DROP to experiment.
+$FilterDrop = 'Runtime.enable,Fetch.enable'
 if ($null -ne $env:CRAWL_FILTER_DROP) { $FilterDrop = $env:CRAWL_FILTER_DROP }
 
 $Root       = $PSScriptRoot
