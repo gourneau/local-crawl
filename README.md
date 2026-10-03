@@ -224,7 +224,7 @@ Claude has its own web fetch. You need to tell it to read pages with crw instead
 
 **Why bother?** Claude's built-in fetch identifies itself as `Claude-User`, doesn't run JavaScript, and refuses some domains outright. crw looks like a normal Chrome browser. In one side-by-side test on bot-protected sites (Reddit, Zillow, Glassdoor, Amazon, NYT), the built-in fetch read 0 of 5 and crw read all 5.
 
-With the local engine, crw has no search tool, so let Claude keep its built-in web search for finding pages. The Docker engine adds `crw_search`, but built-in search works fine either way.
+Let Claude keep its built-in web search for finding pages. The Docker engine adds `crw_search`, but it scrapes public search engines from your home IP, and they block it or serve junk (see [Troubleshooting](#troubleshooting)). Built-in search is far more reliable.
 
 **Minimal version.** One line is enough:
 
@@ -239,7 +239,7 @@ To read web pages, use the crw MCP tools (`crw_scrape`; `crw_map`/`crw_crawl` fo
 
 Finding pages and reading pages use different tools:
 
-- **Finding pages:** use your built-in web search. If it's unavailable, use `crw_search` (Docker engine only). Never use crw to load search-engine result pages (Google, Bing, DuckDuckGo, etc.).
+- **Finding pages:** use your built-in web search. Don't use `crw_search` (its results are unreliable), and never use crw to load search-engine result pages (Google, Bing, DuckDuckGo, etc.).
 - **Reading pages:** use the crw MCP tools instead of the built-in web fetch. crw returns the full page as clean markdown and can render JavaScript.
   - `crw_scrape` reads one URL. If the result is empty, missing content, or a short interstitial ("continue shopping", "verify you are human", "just a moment"), retry with `renderJs: true`. Output is cut at about 15,000 characters; raise `maxLength` only if you need the rest.
   - `crw_map` lists a site's URLs without fetching them. Use it to pick pages, then scrape only those.
@@ -352,7 +352,7 @@ crw's limit on *incoming* API requests is turned off (`rate_limit_rps = 0`). Its
 | A page comes back as a short "continue shopping" or "just a moment" page | That's a bot wall the plain HTTP fetch didn't get past. Retry with `"renderJs": true` (Amazon product pages often need this). |
 | A site blocks every request, even ones that used to work | Your IP has been flagged, often after many requests in a short time. Wait a while, then slow down. |
 | `/v1/search` returns 503, or there's no `crw_search` tool | Search needs the Docker engine, which runs SearXNG. |
-| Search returns few or no results | Search engines rate-limit and CAPTCHA self-hosted SearXNG. The config enables extra engines; in testing, Bing kept answering while others were suspended. Suspensions lift after a while. |
+| Search returns few, no, or unrelated results | Public search engines rate-limit, CAPTCHA, or block self-hosted SearXNG. In one test, every engine except Bing was blocked, and Bing answered "fastcrw web scraper" with running shoes. Check with `docker exec local-crawl-searxng-1 wget -qO- "http://localhost:8080/search?format=json&q=test"` and look at `unresponsive_engines`. Use your AI client's built-in web search instead. |
 | `json` / `summary` formats or `/v1/extract` fail | They need an LLM API key in `[extraction.llm]`. |
 
 The logs are in `logs\`: `crw-server.log`, plus `browser.log` for Chrome.
