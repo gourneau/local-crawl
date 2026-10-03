@@ -4,14 +4,14 @@
 
 .DESCRIPTION
   Runs two background processes:
-    - headless Chrome (or Edge) with a private profile, used to render JS-heavy pages
+    - Chrome (or Edge) with a private profile, used to render JS-heavy pages
     - crw-server.exe, the Firecrawl-compatible REST API
 
   Both bind to 127.0.0.1 only, so nothing is reachable from other machines.
 
 .EXAMPLE
   .\crawl.ps1 start
-  .\crawl.ps1 start -Headed      # show the browser window, for debugging
+  .\crawl.ps1 start -Browser visible   # watch pages render, for debugging
   .\crawl.ps1 status
   .\crawl.ps1 scrape https://example.com
   .\crawl.ps1 stop
@@ -24,23 +24,39 @@ param(
     [Parameter(Position = 1)]
     [string]$Url,
 
-    # Run Chrome with a visible window so you can watch pages render.
+    # hidden:   a real browser window parked off-screen. Sites that detect headless
+    #           Chrome see a normal desktop browser. The default.
+    # visible:  an on-screen window, to watch pages render while debugging.
+    # headless: no window at all. Lightest, but some sites block it.
+    [ValidateSet('hidden', 'visible', 'headless')]
+    [string]$Browser = 'hidden',
+
+    # Same as -Browser visible (kept for older scripts).
     [switch]$Headed
 )
+if ($Headed) { $Browser = 'visible' }
 
 $ErrorActionPreference = 'Stop'
 
 # --- Settings -----------------------------------------------------------------
-$ApiPort = 3002   # crw API: http://127.0.0.1:3002 (3000 is left free for dev servers)
-$CdpPort = 9223   # headless Chrome DevTools port, used only by crw
+$ApiPort    = 3002   # crw API: http://127.0.0.1:3002 (3000 is left free for dev servers)
+$CdpPort    = 9223   # DevTools port crw connects to (the filter, or Chrome if the filter is missing)
+$ChromePort = 9224   # Chrome's own DevTools port, behind the filter
+
+# DevTools commands from crw that the filter answers itself instead of passing to Chrome
+# (comma-separated). Runtime.enable is a well-known automation giveaway, and crw works
+# without it. Override with $env:CRAWL_FILTER_DROP to experiment.
+$FilterDrop = 'Runtime.enable'
+if ($null -ne $env:CRAWL_FILTER_DROP) { $FilterDrop = $env:CRAWL_FILTER_DROP }
 
 $Root       = $PSScriptRoot
 $CrwExe     = Join-Path $Root 'bin\crw-server.exe'
+$FilterExe  = Join-Path $Root 'bin\cdp-filter.exe'
 $RunDir     = Join-Path $Root 'run'
 $LogDir     = Join-Path $Root 'logs'
 $ProfileDir = Join-Path $Root '.chrome-profile'
 $ApiUrl     = "http://127.0.0.1:$ApiPort"
-# 'headed' or 'headless'; also read by the tray app for its Options menu.
+# The running browser's mode ('hidden', 'visible' or 'headless'); also read by the tray app.
 $BrowserModeFile = Join-Path $RunDir 'browser.mode'
 
 $BrowserCandidates = @(
@@ -108,12 +124,12 @@ function Stop-Tracked([string]$Name, [string[]]$ExpectedNames) {
     Remove-Item (Get-PidFile $Name) -Force -ErrorAction SilentlyContinue
 }
 
-# The crawler's browser: the process serving DevTools on $CdpPort, but only if it uses
+# The crawler's browser: the process serving DevTools on $ChromePort, but only if it uses
 # our private profile, so your everyday Chrome is never touched. This is more reliable
 # than the PID Start-Process returns, because chrome.exe can hand off to a new process
 # and exit (for example right after Chrome updates itself).
 function Get-Browser {
-    $conn = Get-NetTCPConnection -State Listen -LocalPort $CdpPort -ErrorAction SilentlyContinue |
+    $conn = Get-NetTCPConnection -State Listen -LocalPort $ChromePort -ErrorAction SilentlyContinue |
         Select-Object -First 1
     if (-not $conn) { return $null }
     $info = Get-CimInstance Win32_Process -Filter "ProcessId=$($conn.OwningProcess)"
@@ -144,10 +160,63 @@ function Clear-ChromeCrashFlag {
     }
 }
 
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class CrawlWindow {
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int cmd);
+    [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr hWnd, int index);
+    [DllImport("user32.dll")] public static extern int SetWindowLong(IntPtr hWnd, int index, int value);
+    [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hWnd, IntPtr processId);
+    [DllImport("user32.dll")] static extern bool AttachThreadInput(uint attach, uint attachTo, bool on);
+    [DllImport("user32.dll")] static extern bool BringWindowToTop(IntPtr hWnd);
+    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+
+    // Give focus back to a window. Windows only lets the foreground thread do that, so
+    // briefly share input state with it (the standard workaround).
+    public static void Activate(IntPtr hWnd) {
+        uint foregroundThread = GetWindowThreadProcessId(GetForegroundWindow(), IntPtr.Zero);
+        uint me = GetCurrentThreadId();
+        bool attached = foregroundThread != me && AttachThreadInput(me, foregroundThread, true);
+        BringWindowToTop(hWnd);
+        SetForegroundWindow(hWnd);
+        if (attached) AttachThreadInput(me, foregroundThread, false);
+    }
+
+    // Keep the window, but take it out of the taskbar and Alt+Tab and send it to the back
+    // without activating it, so it never takes keyboard focus from what you're doing.
+    public static void Tuck(IntPtr hWnd) {
+        const int GWL_EXSTYLE = -20, WS_EX_TOOLWINDOW = 0x80, WS_EX_APPWINDOW = 0x40000, SW_HIDE = 0;
+        const uint SWP_NOSIZE = 0x1, SWP_NOMOVE = 0x2, SWP_NOACTIVATE = 0x10, SWP_SHOWWINDOW = 0x40;
+        ShowWindow(hWnd, SW_HIDE);
+        SetWindowLong(hWnd, GWL_EXSTYLE, (GetWindowLong(hWnd, GWL_EXSTYLE) | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW);
+        SetWindowPos(hWnd, new IntPtr(1), 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
+}
+'@
+
+# Tuck the off-screen browser window away and hand focus back to whatever had it before.
+function Hide-BrowserWindow([System.Diagnostics.Process]$Proc, [IntPtr]$PreviousForeground) {
+    $deadline = (Get-Date).AddSeconds(10)
+    while ($Proc.MainWindowHandle -eq [IntPtr]::Zero -and (Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 200
+        $Proc.Refresh()
+    }
+    if ($Proc.MainWindowHandle -eq [IntPtr]::Zero) { return }
+    [CrawlWindow]::Tuck($Proc.MainWindowHandle)
+    if ($PreviousForeground -ne [IntPtr]::Zero -and $PreviousForeground -ne $Proc.MainWindowHandle) {
+        [CrawlWindow]::Activate($PreviousForeground)
+    }
+}
+
 # The crawler browser's own User-Agent, minus the "Headless" marker, or $null if it isn't up.
 function Get-BrowserUserAgent {
     try {
-        $info = Invoke-RestMethod "http://127.0.0.1:$CdpPort/json/version" -TimeoutSec 3
+        $info = Invoke-RestMethod "http://127.0.0.1:$ChromePort/json/version" -TimeoutSec 3
         return ($info.'User-Agent' -replace 'HeadlessChrome', 'Chrome')
     } catch {
         return $null
@@ -158,9 +227,8 @@ function Get-BrowserUserAgent {
 function Start-Browser {
     if (Get-Browser) {
         $current = Get-Content $BrowserModeFile -Raw -ErrorAction SilentlyContinue
-        $wanted = if ($Headed) { 'headed' } else { 'headless' }
-        if ($current -and $current -ne $wanted) {
-            Write-Warning "Browser is already running $current. Use 'restart' to switch it to $wanted."
+        if ($current -and $current -ne $Browser) {
+            Write-Warning "Browser is already running $current. Use 'restart' to switch it to $Browser."
         } else {
             Write-Host "  browser already running"
         }
@@ -171,12 +239,12 @@ function Start-Browser {
         Write-Warning "No Chrome or Edge found. JS-heavy pages will not render. Set CRW_BROWSER to a chrome.exe path to fix."
         return
     }
-    Assert-PortFree $CdpPort 'the crawler browser'
+    Assert-PortFree $ChromePort 'the crawler browser'
 
     Clear-ChromeCrashFlag
 
     $browserArgs = @(
-        "--remote-debugging-port=$CdpPort",
+        "--remote-debugging-port=$ChromePort",
         '--remote-debugging-address=127.0.0.1',
         "--user-data-dir=`"$ProfileDir`"",
         '--no-first-run',
@@ -190,30 +258,71 @@ function Start-Browser {
         '--disable-blink-features=AutomationControlled',
         'about:blank'
     )
-    if ($Headed) {
-        $mode = 'headed'
-        $windowStyle = 'Normal'
-    } else {
-        $mode = 'headless'
-        $windowStyle = 'Hidden'
-        # The GPU stays on: software rendering is a well-known headless fingerprint.
-        $browserArgs = @('--headless=new') + $browserArgs
+    $windowStyle = 'Normal'
+    switch ($Browser) {
+        'headless' {
+            # The GPU stays on: software rendering is a well-known headless fingerprint.
+            # Headless Chrome calls itself "HeadlessChrome"; give it the normal name instead.
+            $major = (Get-Item $exe).VersionInfo.ProductMajorPart
+            $ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/$major.0.0.0 Safari/537.36"
+            if ($exe -like '*msedge.exe') { $ua += " Edg/$major.0.0.0" }
+            $browserArgs = @('--headless=new', "--user-agent=`"$ua`"") + $browserArgs
+            $windowStyle = 'Hidden'
+        }
+        'hidden' {
+            # A real window parked off-screen, kept rendering at full speed even though
+            # nothing can see it (Chrome otherwise throttles windows it thinks are covered).
+            $browserArgs = @(
+                '--window-position=-32000,-32000',
+                '--window-size=1600,1000',
+                '--disable-backgrounding-occluded-windows',
+                '--disable-renderer-backgrounding',
+                '--disable-background-timer-throttling',
+                '--disable-features=CalculateNativeWinOcclusion'
+            ) + $browserArgs
+        }
     }
+    $foreground = [CrawlWindow]::GetForegroundWindow()
     $null = Start-Process -FilePath $exe -ArgumentList $browserArgs -WindowStyle $windowStyle `
         -RedirectStandardError (Join-Path $LogDir 'browser.log') `
         -RedirectStandardOutput (Join-Path $LogDir 'browser.out.log')
-    Set-Content -Path $BrowserModeFile -Value $mode -NoNewline
+    Set-Content -Path $BrowserModeFile -Value $Browser -NoNewline
 
-    if (Wait-Url "http://127.0.0.1:$CdpPort/json/version" 15) {
-        $browser = Get-Browser
-        if ($browser) { Set-Content -Path (Get-PidFile 'browser') -Value $browser.Id -NoNewline }
-        Write-Host "  browser up   ($(Split-Path $exe -Leaf), $mode, DevTools on 127.0.0.1:$CdpPort)"
+    if (Wait-Url "http://127.0.0.1:$ChromePort/json/version" 15) {
+        $proc = Get-Browser
+        if ($proc) { Set-Content -Path (Get-PidFile 'browser') -Value $proc.Id -NoNewline }
+        if ($proc -and $Browser -eq 'hidden') { Hide-BrowserWindow $proc $foreground }
+        Write-Host "  browser up   ($(Split-Path $exe -Leaf), $Browser, DevTools on 127.0.0.1:$ChromePort)"
     } else {
-        Write-Warning "Browser did not open port $CdpPort. See logs\browser.log. crw will still serve plain HTML pages."
+        Write-Warning "Browser did not open port $ChromePort. See logs\browser.log. crw will still serve plain HTML pages."
     }
 }
 
-function Start-Crw {
+# The DevTools filter between crw and Chrome (see filter\CdpFilter.cs). It drops crw's
+# injected disguise script and User-Agent override so Chrome shows its real fingerprint.
+# Returns the port crw should connect to.
+function Start-Filter {
+    if (-not (Test-Path $FilterExe)) {
+        Write-Warning "Missing $FilterExe (run .\setup.ps1). crw will talk to Chrome directly and inject its own disguise."
+        return $ChromePort
+    }
+    if (Get-Tracked 'cdp-filter' @('cdp-filter')) {
+        Write-Host "  filter already running"
+        return $CdpPort
+    }
+    Assert-PortFree $CdpPort 'the DevTools filter'
+    $filterArgs = @('--listen', $CdpPort, '--upstream', $ChromePort, '--log', "`"$(Join-Path $LogDir 'cdp-filter.log')`"")
+    if ($FilterDrop) { $filterArgs += @('--drop', $FilterDrop) }
+    $proc = Start-Process -FilePath $FilterExe -WindowStyle Hidden -PassThru -ArgumentList $filterArgs
+    Set-Content -Path (Get-PidFile 'cdp-filter') -Value $proc.Id -NoNewline
+    if (-not (Wait-Url "http://127.0.0.1:$CdpPort/json/version" 10)) {
+        throw "The DevTools filter did not start on port $CdpPort. See logs\cdp-filter.log."
+    }
+    Write-Host "  filter up    (127.0.0.1:$CdpPort -> Chrome)"
+    return $CdpPort
+}
+
+function Start-Crw([int]$DevToolsPort) {
     if (Get-Tracked 'crw-server' @('crw-server')) {
         Write-Host "  crw-server already running"
         return
@@ -224,7 +333,7 @@ function Start-Crw {
     # Environment variables override config.local.toml, so the ports live in one place (this file).
     $env:CRW_SERVER__HOST = '127.0.0.1'
     $env:CRW_SERVER__PORT = "$ApiPort"
-    $env:CRW_RENDERER__CHROME__WS_URL = "ws://127.0.0.1:$CdpPort/"
+    $env:CRW_RENDERER__CHROME__WS_URL = "ws://127.0.0.1:$DevToolsPort/"
 
     # crw presents a fixed "Chrome on Mac" User-Agent by default. Present the browser's
     # real one instead, so the header matches what page scripts see about the machine.
@@ -251,10 +360,12 @@ function Invoke-Start {
     Write-Host "Starting local crawler..."
     try {
         Start-Browser
-        Start-Crw
+        $devToolsPort = Start-Filter
+        Start-Crw $devToolsPort
     } catch {
         # Don't leave a half-started setup behind (e.g. a browser with no server).
         Stop-Tracked 'crw-server' @('crw-server')
+        Stop-Tracked 'cdp-filter' @('cdp-filter')
         Stop-Browser
         throw
     }
@@ -267,13 +378,14 @@ function Invoke-Start {
 function Invoke-Stop {
     Write-Host "Stopping local crawler..."
     Stop-Tracked 'crw-server' @('crw-server')
+    Stop-Tracked 'cdp-filter' @('cdp-filter')
     Stop-Browser
     Write-Host "Stopped."
 }
 
 function Invoke-Status {
     $crw = Get-Tracked 'crw-server' @('crw-server')
-    $browser = Get-Browser
+    $browserProc = Get-Browser
 
     if ($crw) {
         $mb = [math]::Round($crw.WorkingSet64 / 1MB, 1)
@@ -283,12 +395,20 @@ function Invoke-Status {
         Write-Host "crw-server : stopped"
     }
 
-    if ($browser) {
-        $cdp = if (Test-Url "http://127.0.0.1:$CdpPort/json/version") { 'DevTools ok' } else { 'DevTools NOT responding' }
+    if ($browserProc) {
+        $cdp = if (Test-Url "http://127.0.0.1:$ChromePort/json/version") { 'DevTools ok' } else { 'DevTools NOT responding' }
         $mode = Get-Content $BrowserModeFile -Raw -ErrorAction SilentlyContinue
-        Write-Host "browser    : running, PID $($browser.Id), $mode, $cdp on port $CdpPort"
+        Write-Host "browser    : running, PID $($browserProc.Id), $mode, $cdp on port $ChromePort"
     } else {
         Write-Host "browser    : stopped"
+    }
+
+    $filter = Get-Tracked 'cdp-filter' @('cdp-filter')
+    if ($filter) {
+        $ok = if (Test-Url "http://127.0.0.1:$CdpPort/json/version") { 'ok' } else { 'NOT responding' }
+        Write-Host "filter     : running, PID $($filter.Id), $ok on port $CdpPort"
+    } else {
+        Write-Host "filter     : stopped"
     }
 }
 

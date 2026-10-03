@@ -25,7 +25,7 @@ $Arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'x64' }
 $Base = "https://github.com/fastcrw/crw/releases/download/v$Version"
 $Temp = Join-Path ([IO.Path]::GetTempPath()) "crw-setup-$Version"
 
-$running = Get-Process crw-server -ErrorAction SilentlyContinue |
+$running = Get-Process crw-server, cdp-filter -ErrorAction SilentlyContinue |
     Where-Object { $_.Path -and $_.Path.StartsWith($Bin, [StringComparison]::OrdinalIgnoreCase) }
 if ($running) { throw "The crawler is running from this folder. Stop it first: .\crawl.ps1 stop" }
 
@@ -58,5 +58,13 @@ foreach ($name in 'crw-server', 'crw', 'crw-mcp') {
 }
 
 Remove-Item $Temp -Recurse -Force -ErrorAction SilentlyContinue
+
+# The DevTools filter (filter\CdpFilter.cs), built with the C# compiler that ships with Windows.
+$csc = "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+& $csc /nologo /target:winexe /optimize+ /out:"$(Join-Path $Bin 'cdp-filter.exe')" `
+    /reference:System.Web.Extensions.dll (Join-Path $Root 'filter\CdpFilter.cs')
+if ($LASTEXITCODE -ne 0) { throw "Building the DevTools filter failed (csc exit code $LASTEXITCODE)." }
+Write-Host "  built cdp-filter.exe"
+
 Write-Host ""
 Write-Host "Done. Next: .\crawl.ps1 start   (or build the tray app: .\tray\install.ps1)"

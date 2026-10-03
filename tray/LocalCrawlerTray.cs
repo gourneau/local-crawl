@@ -53,8 +53,9 @@ class TrayContext : ApplicationContext
     readonly ToolStripMenuItem _toggleItem;
     readonly ToolStripMenuItem _restartItem;
     readonly ToolStripMenuItem _optionsItem;
+    readonly ToolStripMenuItem _hiddenItem;
+    readonly ToolStripMenuItem _visibleItem;
     readonly ToolStripMenuItem _headlessItem;
-    readonly ToolStripMenuItem _headedItem;
     readonly Icon _runningIcon = MakeIcon(Color.FromArgb(46, 160, 67));
     readonly Icon _stoppedIcon = MakeIcon(Color.FromArgb(130, 139, 150));
     readonly Icon _attentionIcon = MakeIcon(Color.FromArgb(212, 160, 23));
@@ -62,9 +63,9 @@ class TrayContext : ApplicationContext
     CrawlerState _state = CrawlerState.Checking;
     bool _busy;
     int _checking;
-    bool _preferHeaded;
+    string _preferredMode;  // browser mode for the next start: "hidden", "visible" or "headless"
     bool _browserUp;
-    string _runningMode;   // "headed", "headless", or null when unknown
+    string _runningMode;    // mode of the running browser, or null when unknown
 
     public TrayContext()
     {
@@ -72,7 +73,8 @@ class TrayContext : ApplicationContext
         _cdpUrl = "http://127.0.0.1:" + ReadSetting("CdpPort", "9223");
         _modeFile = Path.Combine(_root, @"run\browser.mode");
         _preferenceFile = Path.Combine(_root, @"run\tray-browser-mode");
-        _preferHeaded = ReadFile(_preferenceFile) == "headed";
+        _preferredMode = ReadFile(_preferenceFile);
+        if (_preferredMode != "visible" && _preferredMode != "headless") _preferredMode = "hidden";
 
         _ui = new Control();
         IntPtr forceHandle = _ui.Handle;
@@ -84,11 +86,13 @@ class TrayContext : ApplicationContext
         _restartItem = new ToolStripMenuItem("Restart", null,
             delegate { RunAction("restart", "Restarting...", "Crawler restarted."); });
 
-        _headlessItem = new ToolStripMenuItem("Hidden browser (headless)", null, delegate { SetBrowserMode(false); });
-        _headedItem = new ToolStripMenuItem("Visible browser (for debugging)", null, delegate { SetBrowserMode(true); });
+        _hiddenItem = new ToolStripMenuItem("Hidden window (most realistic)", null, delegate { SetBrowserMode("hidden"); });
+        _visibleItem = new ToolStripMenuItem("Visible window (for debugging)", null, delegate { SetBrowserMode("visible"); });
+        _headlessItem = new ToolStripMenuItem("Headless (lightest, easiest to detect)", null, delegate { SetBrowserMode("headless"); });
         _optionsItem = new ToolStripMenuItem("Options");
+        _optionsItem.DropDownItems.Add(_hiddenItem);
+        _optionsItem.DropDownItems.Add(_visibleItem);
         _optionsItem.DropDownItems.Add(_headlessItem);
-        _optionsItem.DropDownItems.Add(_headedItem);
 
         ContextMenuStrip menu = new ContextMenuStrip();
         menu.Items.Add(_statusItem);
@@ -205,9 +209,10 @@ class TrayContext : ApplicationContext
         _optionsItem.Enabled = settled;
 
         // While running, show the mode actually in use; otherwise the one the next start will use.
-        bool headed = (state == CrawlerState.Running && _runningMode != null) ? _runningMode == "headed" : _preferHeaded;
-        _headedItem.Checked = headed;
-        _headlessItem.Checked = !headed;
+        string mode = (state == CrawlerState.Running && _runningMode != null) ? _runningMode : _preferredMode;
+        _hiddenItem.Checked = mode == "hidden";
+        _visibleItem.Checked = mode == "visible";
+        _headlessItem.Checked = mode == "headless";
     }
 
     void SetTooltip(string status)
@@ -226,25 +231,24 @@ class TrayContext : ApplicationContext
             RunAction("start", "Starting...", "Crawler is running at " + _apiUrl);
     }
 
-    void SetBrowserMode(bool headed)
+    void SetBrowserMode(string mode)
     {
-        _preferHeaded = headed;
+        _preferredMode = mode;
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(_preferenceFile));
-            File.WriteAllText(_preferenceFile, headed ? "headed" : "headless");
+            File.WriteAllText(_preferenceFile, mode);
         }
         catch
         {
         }
 
-        string wanted = headed ? "headed" : "headless";
-        if (_state == CrawlerState.Running && _runningMode != wanted)
+        if (_state == CrawlerState.Running && _runningMode != mode)
         {
-            RunAction("restart",
-                headed ? "Opening the browser window..." : "Hiding the browser...",
-                headed ? "Browser is visible. Closing its window stops JS rendering until you restart."
-                       : "Browser is hidden again.");
+            string done = mode == "visible"
+                ? "Browser is visible. Closing its window stops JS rendering until you restart."
+                : "Browser is now " + mode + ".";
+            RunAction("restart", "Switching the browser to " + mode + "...", done);
         }
         else
         {
@@ -256,7 +260,7 @@ class TrayContext : ApplicationContext
     {
         if (_busy) return;
         _busy = true;
-        if (command != "stop" && _preferHeaded) command += " -Headed";
+        if (command != "stop") command += " -Browser " + _preferredMode;
         UpdateUi(CrawlerState.Busy, busyText);
         ThreadPool.QueueUserWorkItem(delegate
         {

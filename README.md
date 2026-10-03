@@ -12,7 +12,8 @@ Run the [fastCRW](https://github.com/fastcrw/crw) web crawler natively on Window
 - **Native and light.** fastCRW is a single Rust binary. On a test machine it idled at about 10–30 MB of RAM.
 - **Firecrawl-compatible API.** `/v1/scrape`, `/v1/crawl` and `/v1/map` return clean markdown, so Firecrawl SDKs work against it.
 - **MCP built in.** Claude Code, Cursor, VS Code and other MCP clients can scrape, crawl and map through it.
-- **JS pages just work.** Plain pages are fetched over HTTP. Single-page apps are rendered by a headless Chrome automatically.
+- **JS pages just work.** Plain pages are fetched over HTTP. Single-page apps are rendered in Chrome automatically.
+- **Looks like a real browser.** Chrome runs as a real window parked off-screen, not headless. A small filter strips crw's automation giveaways, so websites see a genuine Chrome on Windows. See [How it looks to websites](#how-it-looks-to-websites).
 - **Tray app.** Green means running, gray means stopped. Start, stop, restart, view logs, and switch to a visible browser for debugging.
 - **Private by default.** Everything listens on `127.0.0.1` only. One Tailscale command shares it with your own devices, and nothing else.
 
@@ -23,8 +24,10 @@ flowchart LR
     subgraph pc["Your Windows PC"]
         tray["Tray app (LocalCrawler.exe)"] --> script["crawl.ps1"]
         script -->|start / stop| crw["crw-server, 127.0.0.1:3002"]
-        script -->|start / stop| chrome["Chrome, private profile, 127.0.0.1:9223"]
-        crw -->|renders JS pages over DevTools| chrome
+        script -->|start / stop| filter["cdp-filter, 127.0.0.1:9223"]
+        script -->|start / stop| chrome["Chrome, private profile, 127.0.0.1:9224"]
+        crw -->|renders JS pages over DevTools| filter
+        filter -->|"drops automation giveaways"| chrome
         local["Local agents and scripts"] -->|"/mcp and /v1/*"| crw
         serve["tailscale serve (optional)"] --> crw
     end
@@ -33,7 +36,34 @@ flowchart LR
 
 - `crawl.ps1` does all the work. The tray app is a small C# front end that calls it and polls the health endpoints.
 - Chrome runs with its own throwaway profile in `.chrome-profile\`, separate from your everyday browser. The scripts only ever stop the Chrome that uses that profile.
-- **Real identity:** the crawler presents the browser's real identity, such as Chrome 154 on Windows, in both the plain HTTP and browser modes. It also starts Chrome without the automation flag (`navigator.webdriver`). By default crw would claim to be a fixed older Chrome on a Mac.
+- `cdp-filter` sits between crw and Chrome. It is a small C# DevTools proxy built from `filter\CdpFilter.cs`. See below for what it does.
+
+## How it looks to websites
+
+Out of the box, crw's browser has the same kind of telltale signs as Playwright or Puppeteer. This setup removes them in three ways.
+
+**1. A real window, not headless.** By default Chrome runs as a normal window parked off-screen. It's kept out of the taskbar and Alt+Tab, and it never takes keyboard focus. Websites see a real desktop browser with a real screen, taskbar, GPU and plugins. Headless mode is still available, but some sites block it outright. In testing, G2 blocked headless Chrome and allowed the same Chrome as an off-screen window.
+
+**2. No fake disguise.** crw normally injects a script that pretends to be a Mac with Intel graphics and patches browser properties. Fingerprinting scripts catch those lies. For example, CreepJS flagged `hasBadWebGL` and `hasToStringProxy`. The filter drops that script, so Chrome reports its true values:
+- `navigator.webdriver` is genuinely false, because Chrome starts with `--disable-blink-features=AutomationControlled`.
+- WebGL reports the real GPU.
+- Chrome's client hints stay intact. crw's User-Agent override is dropped too, because it blanks them.
+
+**3. No automation tells over DevTools.** The filter also drops `Runtime.enable`. That's the best-known way pages detect Puppeteer and Playwright, and crw works fine without it. The filter logs every DevTools command crw sends to `logs\cdp-filter.log`, so you can audit it yourself.
+
+crw's plain HTTP fetch, used before falling back to Chrome, sends the browser's real User-Agent rather than crw's default "Chrome 150 on a Mac".
+
+Measured with the crawler itself, on Chrome 154 on Windows:
+
+| Test | crw default (headless, own disguise) | This setup |
+|---|---|---|
+| [bot.sannysoft.com](https://bot.sannysoft.com) | 23 / 24 | **31 / 31** |
+| [CreepJS](https://abrahamjuliot.github.io/creepjs/) headless | 67% | **0%** |
+| CreepJS stealth (detected lies) | 40% | **0%** |
+| CreepJS "like headless" | 31% | 19%, from Android-only APIs every desktop Chrome lacks |
+| [stealthcheck.io](https://stealthcheck.io/test) | not measured | 92 / 100 "Excellent", 0 critical |
+| `navigator.webdriver` | true (detected) | false |
+| WebGL | fake Intel Iris (detected) | real GPU |
 
 ## Requirements
 
@@ -72,7 +102,7 @@ If you don't want the tray app, skip `tray\install.ps1` and use `.\crawl.ps1 sta
 Left- or right-click the icon for the menu:
 
 - **Start / Stop crawler** and **Restart**
-- **Options → Hidden browser (headless)** or **Visible browser (for debugging)**. The tray remembers the choice.
+- **Options** chooses the browser mode: **Hidden window (most realistic)**, **Visible window (for debugging)** or **Headless (lightest, easiest to detect)**. The tray remembers the choice.
 - **Show live log** opens a console window that follows the server log.
 - **Open logs folder**, **Open crawler folder**, **Copy API URL**
 - **Exit** asks whether to stop the crawler or leave it running in the background.
@@ -85,10 +115,11 @@ The source is in `tray\`. After editing it, run `.\tray\install.ps1` again. Use 
 
 ```powershell
 .\crawl.ps1 start            # start Chrome + crw-server, wait until healthy
-.\crawl.ps1 start -Headed    # same, with a visible browser window
+.\crawl.ps1 start -Browser visible    # same, with an on-screen browser window
+.\crawl.ps1 start -Browser headless   # no window at all (lightest, easiest to detect)
 .\crawl.ps1 status           # running? healthy? memory? browser mode?
 .\crawl.ps1 stop
-.\crawl.ps1 restart          # add -Headed to restart into visible mode
+.\crawl.ps1 restart          # add -Browser <mode> to switch modes
 .\crawl.ps1 logs             # follow logs\crw-server.log
 .\crawl.ps1 scrape <url>     # print one page as markdown
 ```
@@ -218,7 +249,7 @@ Good to know:
 
 ## Debugging with a visible browser
 
-Choose **Options → Visible browser (for debugging)** in the tray, or run `.\crawl.ps1 restart -Headed`. Chrome opens a window, and pages crw renders appear as tabs, so you can watch what a site does.
+Choose **Options → Visible window (for debugging)** in the tray, or run `.\crawl.ps1 restart -Browser visible`. Chrome opens on screen, and pages crw renders appear as tabs, so you can watch what a site does.
 
 If you close that window, Chrome exits. JS pages then stop rendering until you click **Restart**. Plain HTML pages still work. The tray turns amber when this happens.
 
@@ -229,6 +260,8 @@ If you close that window, Chrome exits. JS pages then stop rendering until you c
 | API and browser ports (default `3002`, `9223`) | Top of `crawl.ps1`. The tray app reads them from there. |
 | robots.txt, request rate, concurrency, render timeouts | `config.local.toml` |
 | Which browser to use | `$env:CRW_BROWSER`, else Chrome for Testing in `browser\chrome-win64\`, else installed Chrome, else Edge |
+| Browser mode (hidden / visible / headless) | Tray **Options**, or `-Browser` on `crawl.ps1` (default `hidden`) |
+| DevTools commands the filter swallows | `$FilterDrop` at the top of `crawl.ps1` (default `Runtime.enable`), or `$env:CRAWL_FILTER_DROP` |
 | fastCRW version | `.\setup.ps1 -Version x.y.z` (stop the crawler first) |
 
 The defaults are polite: robots.txt is respected, with 3 requests per second and 5 concurrent requests.
@@ -260,6 +293,7 @@ setup.ps1           downloads + verifies the fastCRW binaries into bin\
 config.local.toml   crawler settings (crw loads it from this folder)
 start.cmd, stop.cmd double-click wrappers
 tray\               tray app source (C#) and install.ps1
+filter\             DevTools filter source (C#), built into bin\cdp-filter.exe by setup.ps1
 bin\                fastCRW binaries (created by setup.ps1, not committed)
 logs\, run\         logs and process state (not committed)
 .chrome-profile\    the crawler's private Chrome profile (not committed)
