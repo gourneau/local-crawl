@@ -1,0 +1,1956 @@
+From acd4b7f9edd039f2808e4b3473d9082985de02f1 Mon Sep 17 00:00:00 2001
+From: local-crawl <local-crawl@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 10:48:53 -0700
+Subject: [PATCH] Scrape fixes: full CSS selectors in includeTags, clear
+ no-match, no leaked page machinery
+
+includeTags / excludeTags
+- Run every selector on the whole rendered document before the boilerplate
+  cleanup (Firecrawl's order). Before, the cleanup ran first, so a selector
+  reaching into a <header>, an <aside> or a `.promo` card matched nothing.
+  The cleanup still runs inside a selection but never removes a selected
+  element.
+- excludeTags detaches matches from the parsed tree and re-serializes with
+  html5ever, so descendant selectors work across the selection and text is
+  escaped correctly. Nested include matches are emitted once, in document
+  order.
+- A successful includeTags narrowing is final, like css/xpath: no readability
+  re-narrowing, no alternates ladder, no title/description padding. Before, a
+  short selection (a list of prices) scored as low quality and was replaced by
+  the captured-XHR candidate, i.e. a consent banner's CSS and tokens.
+- Warnings: invalid selectors (`invalid_selector: ...`), selectors that
+  matched nothing beside ones that did (`include_tags_partial_match: ...`),
+  and a readable `include_tags_no_match: includeTags matched 0 elements (...)`
+  next to `selector_no_match`. metadata.includeTagsMatches carries per-selector
+  counts.
+
+Page machinery
+- Strip <template> along with script/style/noscript.
+- Never fall back to the raw HTML when cleaning fails; fall back to the
+  document with non-content tags removed.
+- The XHR text candidate only keeps strings that read as prose (no markup,
+  CSS rules, JWTs, base64 or code-like punctuation).
+- onlyMainContent also removes consent managers whose containers say neither
+  "cookie" nor "consent": Osano, Quantcast Choice, Didomi, Usercentrics,
+  Sourcepoint, iubenda.
+
+Rendering
+- A blank ws_url switches a CDP tier off. Before, `[renderer.lightpanda]
+  ws_url = ""` kept LightPanda in the ladder and every JS render failed on it
+  first (reported as lightpandaCrash).
+- A 2xx page with fewer than 20 characters of text gets one try on the next
+  tier of the auto ladder, then an `empty_content: ...` warning listing the
+  renderers tried.
+
+PDF
+- pdf_not_a_pdf / corrupt warnings include the HTTP status, declared
+  Content-Type, size and the HTML <title> or first ~200 characters.
+---
+ crates/crw-cli/src/commands/scrape.rs      |   1 +
+ crates/crw-core/src/config.rs              |  50 +++
+ crates/crw-crawl/src/crawl.rs              |   1 +
+ crates/crw-crawl/src/pdf.rs                |  94 ++++-
+ crates/crw-crawl/src/single.rs             | 110 +++++
+ crates/crw-crawl/tests/empty_content.rs    | 121 ++++++
+ crates/crw-crawl/tests/pdf_tests.rs        |   1 +
+ crates/crw-extract/src/clean.rs            | 414 ++++++++++++-------
+ crates/crw-extract/src/lib.rs              | 167 ++++++--
+ crates/crw-extract/tests/selector_tests.rs | 459 +++++++++++++++++++++
+ crates/crw-renderer/src/lib.rs             |  13 +
+ crates/crw-server/src/routes/mcp.rs        |   1 +
+ crates/crw-server/src/routes/v2/parse.rs   |   1 +
+ 13 files changed, 1251 insertions(+), 182 deletions(-)
+ create mode 100644 crates/crw-crawl/tests/empty_content.rs
+ create mode 100644 crates/crw-extract/tests/selector_tests.rs
+
+diff --git a/crates/crw-cli/src/commands/scrape.rs b/crates/crw-cli/src/commands/scrape.rs
+index 18a0ac1..82e599d 100644
+--- a/crates/crw-cli/src/commands/scrape.rs
++++ b/crates/crw-cli/src/commands/scrape.rs
+@@ -690,6 +690,7 @@ async fn run_local_file(args: &ScrapeArgs) -> Result<(), CmdError> {
+     let source = crw_crawl::pdf::PdfSource {
+         source_url: format!("file://{path}"),
+         status_code: 200,
++        content_type: None,
+         elapsed_ms: 0,
+         source_filename: std::path::Path::new(&path)
+             .file_name()
+diff --git a/crates/crw-core/src/config.rs b/crates/crw-core/src/config.rs
+index 1386628..f275e24 100644
+--- a/crates/crw-core/src/config.rs
++++ b/crates/crw-core/src/config.rs
+@@ -1223,6 +1223,31 @@ impl RendererConfig {
+     pub fn http_timeout(&self) -> u64 {
+         self.http_timeout_ms.unwrap_or(self.page_timeout_ms)
+     }
++
++    /// Treat a CDP endpoint with a blank `ws_url` as not configured.
++    ///
++    /// A blank URL is how a config file switches off a tier the bundled
++    /// defaults turn on (`[renderer.lightpanda] ws_url = ""`), and what
++    /// docker-compose passes for an unset `${VAR}`. Before this, the tier stayed
++    /// in the ladder with an empty URL: every JS render first failed on it
++    /// (reported as `lightpandaCrash`) and only then reached Chrome, and the
++    /// deadline math counted a tier that could never answer.
++    pub fn drop_blank_endpoints(&mut self) {
++        for endpoint in [
++            &mut self.lightpanda,
++            &mut self.playwright,
++            &mut self.chrome,
++            &mut self.chrome_proxy,
++        ] {
++            if endpoint
++                .as_ref()
++                .is_some_and(|e| e.ws_url.trim().is_empty())
++            {
++                *endpoint = None;
++            }
++        }
++    }
++
+     pub fn lightpanda_timeout(&self) -> u64 {
+         self.lightpanda_timeout_ms.unwrap_or(self.page_timeout_ms)
+     }
+@@ -2120,6 +2145,8 @@ impl AppConfig {
+             app.client.api_key = Some(api_key);
+         }
+ 
++        app.renderer.drop_blank_endpoints();
++
+         Ok(app)
+     }
+ 
+@@ -3434,6 +3461,29 @@ search_backend_url = "http://from-file:8080"
+         assert_eq!(r.playwright.unwrap().ws_url, "ws://pw:9222");
+     }
+ 
++    #[test]
++    fn blank_endpoint_url_switches_the_tier_off() {
++        let mut r: RendererConfig = toml::from_str(
++            r#"
++            [lightpanda]
++            ws_url = ""
++            [playwright]
++            ws_url = "   "
++            [chrome]
++            ws_url = "ws://chrome:9222/"
++            "#,
++        )
++        .unwrap();
++        assert!(
++            r.lightpanda.is_some(),
++            "parsing alone keeps the blank endpoint"
++        );
++        r.drop_blank_endpoints();
++        assert!(r.lightpanda.is_none());
++        assert!(r.playwright.is_none());
++        assert_eq!(r.chrome.as_ref().unwrap().ws_url, "ws://chrome:9222/");
++    }
++
+     #[test]
+     fn cdp_endpoint_missing_ws_url_errors() {
+         let result: Result<CdpEndpoint, _> = toml::from_str("");
+diff --git a/crates/crw-crawl/src/crawl.rs b/crates/crw-crawl/src/crawl.rs
+index 6f3b871..e514204 100644
+--- a/crates/crw-crawl/src/crawl.rs
++++ b/crates/crw-crawl/src/crawl.rs
+@@ -448,6 +448,7 @@ async fn run_crawl_inner(opts: CrawlOptions<'_>) {
+             let source = crate::pdf::PdfSource {
+                 source_url: fetch_result.url.clone(),
+                 status_code: fetch_result.status_code,
++                content_type: fetch_result.content_type.clone(),
+                 elapsed_ms: fetch_result.elapsed_ms,
+                 source_filename: None,
+             };
+diff --git a/crates/crw-crawl/src/pdf.rs b/crates/crw-crawl/src/pdf.rs
+index 0110b46..0ffa783 100644
+--- a/crates/crw-crawl/src/pdf.rs
++++ b/crates/crw-crawl/src/pdf.rs
+@@ -310,6 +310,9 @@ pub struct PdfSource {
+     pub source_url: String,
+     /// HTTP status of the originating fetch (200 for uploads).
+     pub status_code: u16,
++    /// Content-Type the server declared for the body (`None` for uploads).
++    /// Only used to explain a failed conversion.
++    pub content_type: Option<String>,
+     /// Fetch/handling time in ms (0 for uploads — conversion time is added).
+     pub elapsed_ms: u64,
+     /// Original filename for uploads; `None` for URL fetches.
+@@ -381,6 +384,9 @@ pub async fn convert_pdf_bytes(
+     let want_plaintext = req.formats.contains(&OutputFormat::PlainText);
+     let max_pages = pdf_max_pages(req);
+     let started = std::time::Instant::now();
++    // Kept to explain a failure: the parse below consumes the bytes.
++    let body_len = bytes.len();
++    let body_head = bytes[..bytes.len().min(BODY_HINT_BYTES)].to_vec();
+ 
+     // Funnel through the global parse gate (concurrency cap + timeout + page cap).
+     let result = run_parse(bytes, want_plaintext, max_pages).await;
+@@ -399,14 +405,64 @@ pub async fn convert_pdf_bytes(
+             // Soft-fail: empty markdown + a warning. Upload callers map this to
+             // an HTTP error themselves (they call the strict variant).
+             tracing::warn!(url = %source.source_url, "pdf conversion failed: {err}");
++            let message = match &err {
++                PdfError::NotAPdf | PdfError::Corrupt(_) => format!(
++                    "{err} ({})",
++                    describe_body(
++                        &body_head,
++                        body_len,
++                        source.status_code,
++                        source.content_type.as_deref()
++                    )
++                ),
++                _ => err.to_string(),
++            };
+             let mut data = empty_pdf_scrape_data(req, &source, source.elapsed_ms + convert_ms);
+-            data.warnings.push(err.to_string());
+-            data.warning = Some(err.to_string());
++            data.warnings.push(message.clone());
++            data.warning = Some(message);
+             Ok(data)
+         }
+     }
+ }
+ 
++/// How much of a failed body to keep for [`describe_body`].
++const BODY_HINT_BYTES: usize = 4096;
++
++/// Say what a body that should have been a PDF actually was: the status, the
++/// declared Content-Type, the size, and the HTML `<title>` or the first ~200
++/// characters. A login wall, a bot challenge or an error page served with a
++/// PDF Content-Type (or a `.pdf` URL) then reads differently from a damaged file.
++fn describe_body(head: &[u8], total_len: usize, status: u16, content_type: Option<&str>) -> String {
++    let content_type = content_type.unwrap_or("not given");
++    let mut out = format!("HTTP {status}, Content-Type: {content_type}, {total_len} bytes");
++    let text = String::from_utf8_lossy(head);
++    if let Some(title) = html_title(&text) {
++        out.push_str(&format!("; looks like an HTML page titled {title:?}"));
++    } else {
++        let start: String = text
++            .chars()
++            .take(200)
++            .map(|c| if c.is_control() { ' ' } else { c })
++            .collect();
++        let start = start.split_whitespace().collect::<Vec<_>>().join(" ");
++        out.push_str(&format!("; starts with {start:?}"));
++    }
++    out
++}
++
++/// The text of the first `<title>` element, if the text looks like HTML.
++fn html_title(text: &str) -> Option<String> {
++    let lower = text.to_ascii_lowercase();
++    let open = lower.find("<title")?;
++    let content_start = open + lower[open..].find('>')? + 1;
++    let content_end = content_start + lower[content_start..].find("</title")?;
++    let title = text[content_start..content_end]
++        .split_whitespace()
++        .collect::<Vec<_>>()
++        .join(" ");
++    (!title.is_empty()).then(|| title.chars().take(200).collect())
++}
++
+ /// Emit prometheus metrics for one conversion attempt.
+ fn record_metrics(result: &Result<PdfExtract, PdfError>, convert_ms: u64) {
+     let m = crw_core::metrics::metrics();
+@@ -937,6 +993,7 @@ mod tests {
+         PdfSource {
+             source_url: "https://example.com/doc.pdf".to_string(),
+             status_code: 200,
++            content_type: Some("application/pdf".to_string()),
+             elapsed_ms: 5,
+             source_filename: None,
+         }
+@@ -1039,6 +1096,7 @@ mod tests {
+         let source = PdfSource {
+             source_url: "https://example.com/report.pdf".to_string(),
+             status_code: 206,
++            content_type: None,
+             elapsed_ms: 11,
+             source_filename: Some("report.pdf".to_string()),
+         };
+@@ -1302,6 +1360,38 @@ mod tests {
+         assert_eq!(data.credit_cost, 1, "page_count 0 floors to 1 credit");
+     }
+ 
++    #[tokio::test]
++    async fn not_a_pdf_warning_says_what_the_body_was() {
++        let req = ScrapeRequest::default();
++        let page = b"<!doctype html><html><head><title>Access Denied</title></head>\
++                     <body>You don't have permission to access this file.</body></html>";
++        let data = convert_pdf_bytes(page.to_vec(), &req, test_source())
++            .await
++            .expect("URL path never hard-fails");
++        let warning = data.warning.expect("a warning");
++        assert!(warning.starts_with("pdf_not_a_pdf"), "{warning}");
++        assert!(warning.contains("HTTP 200"), "{warning}");
++        assert!(
++            warning.contains("Content-Type: application/pdf"),
++            "{warning}"
++        );
++        assert!(
++            warning.contains(&format!("{} bytes", page.len())),
++            "{warning}"
++        );
++        assert!(warning.contains(r#"titled "Access Denied""#), "{warning}");
++        assert_eq!(data.warnings, vec![warning]);
++    }
++
++    #[test]
++    fn describe_body_falls_back_to_the_first_characters() {
++        let d = describe_body(b"Rate limit exceeded.\r\nTry again later.", 37, 429, None);
++        assert_eq!(
++            d,
++            r#"HTTP 429, Content-Type: not given, 37 bytes; starts with "Rate limit exceeded. Try again later.""#
++        );
++    }
++
+     #[tokio::test]
+     async fn convert_pdf_bytes_zero_page_pdf_does_not_panic() {
+         let req = ScrapeRequest::default();
+diff --git a/crates/crw-crawl/src/single.rs b/crates/crw-crawl/src/single.rs
+index 9e91ead..8faa8ca 100644
+--- a/crates/crw-crawl/src/single.rs
++++ b/crates/crw-crawl/src/single.rs
+@@ -468,6 +468,7 @@ async fn scrape_url_inner(
+         let source = crate::pdf::PdfSource {
+             source_url: fetch_result.url.clone(),
+             status_code: fetch_result.status_code,
++            content_type: fetch_result.content_type.clone(),
+             elapsed_ms: fetch_result.elapsed_ms,
+             source_filename: None,
+         };
+@@ -791,6 +792,97 @@ async fn scrape_url_inner(
+                 }
+             }
+         }
++
++        // A 2xx page that still has (almost) no text after the escalation
++        // above: a soft block or a render that had not finished. The ladder
++        // above only climbs out of the non-browser tiers, so a browser tier
++        // that came back empty used to be returned as an empty success with no
++        // warning. Give the next tier in the auto ladder one try, then say what
++        // happened. Not for a request the caller narrowed (an empty selection
++        // is its own answer) or pinned to one renderer.
++        let narrowed =
++            !req.include_tags.is_empty() || req.css_selector.is_some() || req.xpath.is_some();
++        let md_len_now = data
++            .markdown
++            .as_deref()
++            .map(|s| s.trim().len())
++            .unwrap_or(0);
++        if md_len_now < EMPTY_CONTENT_CHARS
++            && !narrowed
++            && pinned.is_none()
++            && should_escalate_status
++            && req.formats.contains(&OutputFormat::Markdown)
++        {
++            let mut tried = renderers_tried(&fetch_result);
++            let last = escalated_renderer
++                .as_ref()
++                .and_then(|(r, _)| r.clone())
++                .or_else(|| fetch_result.rendered_with.clone());
++            if let Some(last) = last.as_deref()
++                && !tried.iter().any(|t| t == last)
++            {
++                tried.push(last.to_string());
++            }
++            let next = last
++                .as_deref()
++                .filter(|r| !matches!(*r, "http" | "http_only_fallback" | "impersonated-http"))
++                .and_then(|r| renderer.next_tier_after(r))
++                .map(str::to_string);
++            if let Some(next) = next
++                && escalation_eligible
++                && deadline.remaining() >= crw_renderer::MIN_TIER_BUDGET
++            {
++                tried.push(next.clone());
++                tracing::info!(url = %req.url, from = ?last, to = %next, "empty page, trying the next renderer");
++                if let Ok(mut retry) = renderer
++                    .fetch(
++                        &req.url,
++                        &req.headers,
++                        Some(true),
++                        req.wait_for,
++                        Some(next.as_str()),
++                        deadline,
++                    )
++                    .await
++                    && let Ok(retry_data) =
++                        crate::extract_pool::extract_offloaded(build_owned_extract_input(
++                            &retry,
++                            req,
++                            extraction_cfg,
++                            debug_enabled,
++                            debug_sink.clone(),
++                        ))
++                        .await
++                {
++                    let retry_len = retry_data
++                        .markdown
++                        .as_deref()
++                        .map(|s| s.trim().len())
++                        .unwrap_or(0);
++                    if retry_len > md_len_now {
++                        escalated_renderer =
++                            Some((retry.rendered_with.clone(), retry.render_decision.clone()));
++                        effective_warning = derive_target_warning(&retry);
++                        fetch_result.screenshot = retry.screenshot.take();
++                        fetch_result.html = std::mem::take(&mut retry.html);
++                        data = retry_data;
++                    }
++                }
++            }
++            let md_len_final = data
++                .markdown
++                .as_deref()
++                .map(|s| s.trim().len())
++                .unwrap_or(0);
++            if md_len_final < EMPTY_CONTENT_CHARS {
++                data.warnings.push(format!(
++                    "empty_content: HTTP {} but only {md_len_final} characters of text were \
++                     extracted (renderers tried: {})",
++                    fetch_result.status_code,
++                    tried.join(", ")
++                ));
++            }
++        }
+         data
+     };
+     // ROOT-CAUSE: classify the anti-bot outcome ONCE here, at the shared choke,
+@@ -1357,6 +1449,24 @@ fn is_empty_truncated_render(
+         && markdown.map(|m| m.trim().is_empty()).unwrap_or(true)
+ }
+ 
++/// Below this many characters of extracted text a 2xx page counts as empty:
++/// it gets one more renderer and an `empty_content` warning. Deliberately well
++/// under the escalation thresholds above: a real page can be a single short
++/// heading ("Pro plan costs 99 USD"), and that is an answer, not a failure.
++const EMPTY_CONTENT_CHARS: usize = 20;
++
++/// The renderers a fetch went through, in order, for the `empty_content`
++/// warning: the failover chain when there was one, else the tier that served it.
++fn renderers_tried(fetch_result: &FetchResult) -> Vec<String> {
++    use crw_core::types::RenderDecision;
++    match &fetch_result.render_decision {
++        Some(RenderDecision::Failover { chain, .. }) => {
++            chain.iter().map(|k| k.as_str().to_string()).collect()
++        }
++        _ => fetch_result.rendered_with.iter().cloned().collect(),
++    }
++}
++
+ pub(crate) fn derive_target_warning(fetch_result: &FetchResult) -> Option<String> {
+     // Anti-bot detection wins over any other warning. The renderer chain
+     // annotates thin results with "X returned a loading placeholder", but the
+diff --git a/crates/crw-crawl/tests/empty_content.rs b/crates/crw-crawl/tests/empty_content.rs
+new file mode 100644
+index 0000000..aae2e9f
+--- /dev/null
++++ b/crates/crw-crawl/tests/empty_content.rs
+@@ -0,0 +1,121 @@
++//! A 2xx page with no extractable text is reported, not returned as a silent
++//! empty success. Offline: the origin is a wiremock server and the renderer is
++//! HTTP-only, so there is no next tier to retry with.
++
++use std::sync::Arc;
++
++use crw_core::config::{ExtractionConfig, RendererConfig, StealthConfig};
++use crw_core::types::{OutputFormat, ScrapeRequest};
++use crw_crawl::single::scrape_url;
++use crw_renderer::FallbackRenderer;
++use wiremock::matchers::{method, path};
++use wiremock::{Mock, MockServer, ResponseTemplate};
++
++const UA: &str = "crw-test/0.0";
++
++async fn page_server(body: &str) -> (MockServer, String) {
++    let server = MockServer::start().await;
++    Mock::given(method("GET"))
++        .and(path("/page"))
++        .respond_with(
++            // set_body_raw, not set_body_string: the latter forces text/plain,
++            // and crw (correctly) does not run a plain-text body through HTML.
++            ResponseTemplate::new(200)
++                .set_body_raw(body.as_bytes().to_vec(), "text/html; charset=utf-8"),
++        )
++        .mount(&server)
++        .await;
++    let url = format!("{}/page", server.uri());
++    (server, url)
++}
++
++async fn scrape(req: &ScrapeRequest) -> crw_core::types::ScrapeData {
++    let renderer = Arc::new(
++        FallbackRenderer::new(
++            &RendererConfig::default(),
++            UA,
++            None,
++            &StealthConfig::default(),
++        )
++        .expect("renderer"),
++    );
++    scrape_url(
++        req,
++        &renderer,
++        None,
++        &ExtractionConfig::default(),
++        UA,
++        false,
++        Some(false),
++        crw_core::deadline::Deadline::from_request_ms(30_000),
++    )
++    .await
++    .expect("scrape")
++}
++
++fn markdown_request(url: &str) -> ScrapeRequest {
++    ScrapeRequest {
++        url: url.to_string(),
++        formats: vec![OutputFormat::Markdown],
++        ..Default::default()
++    }
++}
++
++#[tokio::test]
++async fn an_empty_200_page_gets_an_empty_content_warning() {
++    // What a soft block or an unfinished render looks like: a 200 whose body
++    // is only page machinery.
++    let (_server, url) = page_server(
++        "<html><head><title>x</title><script>window.__APP__={}</script></head>\
++         <body><div id=\"root\"></div><style>#root{min-height:100vh}</style></body></html>",
++    )
++    .await;
++    let data = scrape(&markdown_request(&url)).await;
++    let warning = data
++        .warnings
++        .iter()
++        .find(|w| w.starts_with("empty_content:"))
++        .unwrap_or_else(|| panic!("expected an empty_content warning, got {:?}", data.warnings));
++    assert!(warning.contains("HTTP 200"), "{warning}");
++    assert!(warning.contains("renderers tried: http"), "{warning}");
++}
++
++#[tokio::test]
++async fn a_short_real_page_is_not_called_empty() {
++    let (_server, url) =
++        page_server("<html><body><h1>Pro plan costs 99 USD</h1></body></html>").await;
++    let data = scrape(&markdown_request(&url)).await;
++    assert!(
++        !data
++            .warnings
++            .iter()
++            .any(|w| w.starts_with("empty_content:")),
++        "{:?}",
++        data.warnings
++    );
++}
++
++#[tokio::test]
++async fn an_empty_selection_is_not_reported_as_an_empty_page() {
++    // includeTags that matched nothing has its own warning; the page itself is fine.
++    let (_server, url) = page_server(
++        "<html><body><article><p>Plenty of real text here.</p></article></body></html>",
++    )
++    .await;
++    let mut req = markdown_request(&url);
++    req.include_tags = vec![".not-on-this-page".into()];
++    let data = scrape(&req).await;
++    assert!(
++        data.warnings.iter().any(|w| w == "selector_no_match"),
++        "{:?}",
++        data.warnings
++    );
++    assert!(
++        !data
++            .warnings
++            .iter()
++            .any(|w| w.starts_with("empty_content:")),
++        "{:?}",
++        data.warnings
++    );
++}
+diff --git a/crates/crw-crawl/tests/pdf_tests.rs b/crates/crw-crawl/tests/pdf_tests.rs
+index 732ae18..a8aee69 100644
+--- a/crates/crw-crawl/tests/pdf_tests.rs
++++ b/crates/crw-crawl/tests/pdf_tests.rs
+@@ -10,6 +10,7 @@ fn source() -> PdfSource {
+     PdfSource {
+         source_url: "https://example.com/doc.pdf".to_string(),
+         status_code: 200,
++        content_type: None,
+         elapsed_ms: 5,
+         source_filename: None,
+     }
+diff --git a/crates/crw-extract/src/clean.rs b/crates/crw-extract/src/clean.rs
+index b412a70..7fb484e 100644
+--- a/crates/crw-extract/src/clean.rs
++++ b/crates/crw-extract/src/clean.rs
+@@ -1,12 +1,41 @@
+-use lol_html::html_content::UserData;
++use lol_html::html_content::{Element, UserData};
+ use lol_html::{RewriteStrSettings, element, rewrite_str};
+ 
+ /// Marker for `<header>`/`<aside>` nested inside `<main>`/`<article>`, which
+ /// are article furniture rather than site chrome and must survive cleaning.
++/// Flags are bits, so one element can carry several.
+ const KEEP_NESTED: u8 = 1;
+-use scraper::{Html, Selector};
++/// Marker for an element the caller selected with `include_tags`. The
++/// boilerplate rules may still clean inside it, but never remove it: the caller
++/// named it, so it is content by definition.
++const KEEP_SELECTED: u8 = 2;
++/// Attribute on the wrapper put around each element `include_tags` selected,
++/// so the streaming pass can recognise the selected elements (its direct
++/// children). The wrapper itself is unwrapped in that same pass.
++const INCLUDE_WRAPPER_ATTR: &str = "data-crw-include";
++
++fn keep_flags(el: &Element<'_, '_>) -> u8 {
++    el.user_data().downcast_ref::<u8>().copied().unwrap_or(0)
++}
++
++fn add_keep_flag(el: &mut Element<'_, '_>, flag: u8) {
++    let flags = keep_flags(el) | flag;
++    el.set_user_data(flags);
++}
++
++use scraper::{ElementRef, Html, Selector};
+ use std::collections::HashSet;
+ 
++/// What the caller's `include_tags` matched, reported back on the response so a
++/// selector that matched nothing (or less than expected) is visible.
++#[derive(Debug, Default, Clone, PartialEq, Eq)]
++pub struct SelectorReport {
++    /// Elements matched per `include_tags` entry, in request order, counted on
++    /// the full document before `exclude_tags` is applied. Invalid selectors
++    /// are reported as warnings and have no entry here.
++    pub include_matches: Vec<(String, usize)>,
++}
++
+ /// How much boilerplate removal to apply beyond the always-unwanted tags.
+ #[derive(Clone, Copy, PartialEq, Eq)]
+ pub(crate) enum CleanDepth {
+@@ -28,7 +57,13 @@ pub(crate) enum CleanDepth {
+ }
+ 
+ /// Clean HTML by stripping scripts, styles, and optionally non-content elements.
+-/// Then apply include_tags/exclude_tags via scraper.
++///
++/// `include_tags` / `exclude_tags` are applied FIRST, to the whole document, so
++/// any CSS selector sees the full DOM: a selector that reaches into a
++/// `<header>`, an `<aside>` or a `.promo` card matches even though the
++/// boilerplate rules below would remove those. Firecrawl orders it the same
++/// way. The boilerplate rules then run on what was selected, but never remove
++/// a selected element itself.
+ ///
+ /// Soft-failure warnings (e.g. `selector_no_match`) are discarded. Use
+ /// [`clean_html_with_warnings`] when the caller wants to surface them.
+@@ -44,6 +79,7 @@ pub fn clean_html(
+         include_tags,
+         exclude_tags,
+         &mut Vec::new(),
++        &mut SelectorReport::default(),
+     )
+ }
+ 
+@@ -64,18 +100,49 @@ pub(crate) fn clean_html_at(
+     exclude_tags: &[String],
+     warnings: &mut Vec<String>,
+ ) -> Result<String, String> {
+-    clean_html_impl(html, depth, include_tags, exclude_tags, warnings)
++    clean_html_impl(
++        html,
++        depth,
++        include_tags,
++        exclude_tags,
++        warnings,
++        &mut SelectorReport::default(),
++    )
+ }
+ 
+-/// Like [`clean_html`], but collects soft-failure warnings into `warnings`.
+-/// Currently the only warning is `selector_no_match`, emitted when one or more
+-/// `include_tags` are supplied but none match any element.
++/// Like [`clean_html`], but collects soft-failure warnings into `warnings`:
++///
++/// - `selector_no_match` plus a readable `include_tags_no_match: …` line when
++///   `include_tags` are supplied but match nothing (the output is then empty);
++/// - `include_tags_partial_match: …` for each selector that matched nothing
++///   while another one matched;
++/// - `invalid_selector: …` for a selector that is not valid CSS.
+ pub fn clean_html_with_warnings(
+     html: &str,
+     only_main_content: bool,
+     include_tags: &[String],
+     exclude_tags: &[String],
+     warnings: &mut Vec<String>,
++) -> Result<String, String> {
++    clean_html_with_report(
++        html,
++        only_main_content,
++        include_tags,
++        exclude_tags,
++        warnings,
++        &mut SelectorReport::default(),
++    )
++}
++
++/// Like [`clean_html_with_warnings`], and also reports how many elements each
++/// `include_tags` selector matched.
++pub fn clean_html_with_report(
++    html: &str,
++    only_main_content: bool,
++    include_tags: &[String],
++    exclude_tags: &[String],
++    warnings: &mut Vec<String>,
++    report: &mut SelectorReport,
+ ) -> Result<String, String> {
+     clean_html_impl(
+         html,
+@@ -83,6 +150,7 @@ pub fn clean_html_with_warnings(
+         include_tags,
+         exclude_tags,
+         warnings,
++        report,
+     )
+ }
+ 
+@@ -92,9 +160,33 @@ fn clean_html_impl(
+     include_tags: &[String],
+     exclude_tags: &[String],
+     warnings: &mut Vec<String>,
++    report: &mut SelectorReport,
+ ) -> Result<String, String> {
+-    // Phase 1: lol_html streaming removal of always-unwanted tags.
++    // Phase 1: the caller's include_tags / exclude_tags, on the whole document.
++    let selected;
++    let html: &str = if include_tags.is_empty() && exclude_tags.is_empty() {
++        html
++    } else {
++        selected = apply_tag_selectors(html, include_tags, exclude_tags, warnings, report);
++        &selected
++    };
++    if !include_tags.is_empty() && html.is_empty() {
++        return Ok(String::new());
++    }
++
++    // Phase 2: lol_html streaming removal of unwanted tags.
+     let mut handlers = vec![
++        // Recognise what include_tags selected (see INCLUDE_WRAPPER_ATTR), then
++        // drop the wrapper. Registered first: handlers run in registration
++        // order, so the removal rules below see the flag.
++        element!("[data-crw-include] > *", |el| {
++            add_keep_flag(el, KEEP_SELECTED);
++            Ok(())
++        }),
++        element!("[data-crw-include]", |el| {
++            el.remove_and_keep_content();
++            Ok(())
++        }),
+         // <head> carries <title>/<meta>, which htmd would otherwise render as
+         // a bare text line at the top of the markdown, duplicating the H1.
+         element!("head", |el| {
+@@ -113,6 +205,12 @@ fn clean_html_impl(
+             el.remove();
+             Ok(())
+         }),
++        // Inert markup a script stamps out later: client-side templates, often
++        // full of `{{placeholders}}` or encoded HTML. Never page content as is.
++        element!("template", |el| {
++            el.remove();
++            Ok(())
++        }),
+         element!("iframe", |el| {
+             el.remove();
+             Ok(())
+@@ -138,7 +236,9 @@ fn clean_html_impl(
+ 
+     if depth != CleanDepth::Chrome {
+         handlers.push(element!("nav", |el| {
+-            el.remove();
++            if keep_flags(el) & KEEP_SELECTED == 0 {
++                el.remove();
++            }
+             Ok(())
+         }));
+ 
+@@ -157,35 +257,39 @@ fn clean_html_impl(
+         handlers.push(element!(
+             "main header, main aside, main footer, article header, article aside, article footer",
+             |el| {
+-                el.set_user_data(KEEP_NESTED);
++                add_keep_flag(el, KEEP_NESTED);
+                 Ok(())
+             }
+         ));
+         handlers.push(element!("header", |el| {
+-            if el.user_data().downcast_ref::<u8>() != Some(&KEEP_NESTED) {
++            if keep_flags(el) == 0 {
+                 el.remove();
+             }
+             Ok(())
+         }));
+         handlers.push(element!("footer", |el| {
+-            if el.user_data().downcast_ref::<u8>() != Some(&KEEP_NESTED) {
++            if keep_flags(el) == 0 {
+                 el.remove();
+             }
+             Ok(())
+         }));
+         handlers.push(element!("aside", |el| {
+-            if el.user_data().downcast_ref::<u8>() != Some(&KEEP_NESTED) {
++            if keep_flags(el) == 0 {
+                 el.remove();
+             }
+             Ok(())
+         }));
+         handlers.push(element!("menu", |el| {
+-            el.remove();
++            if keep_flags(el) & KEEP_SELECTED == 0 {
++                el.remove();
++            }
+             Ok(())
+         }));
+         // Dropdown <select> elements are never publishable content.
+         handlers.push(element!("select", |el| {
+-            el.remove();
++            if keep_flags(el) & KEEP_SELECTED == 0 {
++                el.remove();
++            }
+             Ok(())
+         }));
+     }
+@@ -204,6 +308,10 @@ fn clean_html_impl(
+             if matches!(tag_name, "html" | "head" | "body" | "main") {
+                 return Ok(());
+             }
++            // The caller selected this element by name; it is not noise.
++            if keep_flags(el) & KEEP_SELECTED != 0 {
++                return Ok(());
++            }
+ 
+             let class = el.get_attribute("class").unwrap_or_default().to_lowercase();
+             let id = el.get_attribute("id").unwrap_or_default().to_lowercase();
+@@ -279,6 +387,16 @@ fn clean_html_impl(
+                 "nav-box",
+                 "cookie",
+                 "consent",
++                // Consent managers whose containers say neither "cookie" nor
++                // "consent": Osano, Quantcast Choice, Didomi, Usercentrics,
++                // Sourcepoint, iubenda. (OneTrust's `onetrust-consent-sdk` and
++                // Cookiebot's `CybotCookiebotDialog` are caught above.)
++                "osano-cm",
++                "qc-cmp2",
++                "didomi",
++                "usercentrics",
++                "sp_message_container",
++                "iubenda-cs",
+                 "widget-area",
+                 "widget_area",
+                 "disqus",
+@@ -391,149 +509,145 @@ fn clean_html_impl(
+         .fold(RewriteStrSettings::new(), |s, h| {
+             s.append_element_content_handler(h)
+         });
+-    let mut result = rewrite_str(html, settings).map_err(|e| e.to_string())?;
+-
+-    // Phase 2: If include_tags specified, only keep content matching those selectors.
+-    if !include_tags.is_empty() {
+-        result = keep_only_selectors(&result, include_tags, warnings);
+-    }
+-
+-    // Phase 3: Apply exclude_tags — parse again and collect text/html without excluded.
+-    if !exclude_tags.is_empty() {
+-        result = remove_by_selectors(&result, exclude_tags);
+-    }
+-
+-    Ok(result)
++    rewrite_str(html, settings).map_err(|e| e.to_string())
+ }
+ 
+-/// Keep only the HTML of elements matching any of the given CSS selectors.
++/// The fallback when the streaming clean fails: the document with every tag
++/// whose text is never content removed (`script`, `style`, `noscript`,
++/// `template`, `head`, `iframe`, `svg`, `canvas`), and nothing else touched.
+ ///
+-/// When none of the selectors match (or all are invalid), returns an empty
+-/// string and pushes `selector_no_match` into `warnings`. Previously this fell
+-/// back to the entire `html`, which silently dumped the full page into the
+-/// output — a footgun for LLM agents whose context fills up.
+-fn keep_only_selectors(html: &str, selectors: &[String], warnings: &mut Vec<String>) -> String {
+-    let doc = Html::parse_document(html);
+-    let mut parts = Vec::new();
+-
+-    for sel_str in selectors {
+-        match Selector::parse(sel_str) {
+-            Ok(sel) => {
+-                for el in doc.select(&sel) {
+-                    parts.push(el.html());
+-                }
+-            }
+-            Err(e) => {
+-                tracing::warn!("Invalid CSS selector '{}': {:?}", sel_str, e);
+-            }
++/// Callers used to fall back to the raw HTML, which put style sheets, inline
++/// scripts and client-side templates straight into the markdown.
++pub(crate) fn strip_non_content(html: &str) -> String {
++    static NON_CONTENT: once_cell::sync::Lazy<Selector> = once_cell::sync::Lazy::new(|| {
++        Selector::parse("script, style, noscript, template, head, iframe, svg, canvas")
++            .expect("static selector parses")
++    });
++    let mut doc = Html::parse_document(html);
++    let ids: Vec<_> = doc.select(&NON_CONTENT).map(|el| el.id()).collect();
++    for id in ids {
++        if let Some(mut node) = doc.tree.get_mut(id) {
++            node.detach();
+         }
+     }
+-
+-    if parts.is_empty() {
+-        warnings.push("selector_no_match".to_string());
+-        return String::new();
+-    }
+-
+-    parts.join("\n")
++    doc.html()
+ }
+ 
+-/// Remove elements matching CSS selectors from the document.
+-/// Re-serializes the tree, skipping matched subtrees via tree node indices.
+-fn remove_by_selectors(html: &str, selectors: &[String]) -> String {
+-    let doc = Html::parse_document(html);
+-
+-    // Collect pointers to matched elements for exclusion.
+-    // SAFETY: All pointers point into `doc` which lives for the entire function scope.
+-    // We only compare pointers (never dereference), so this is safe as long as `doc` is alive.
+-    let mut skip_ptrs: HashSet<*const scraper::node::Element> = HashSet::new();
+-    for sel_str in selectors {
+-        match Selector::parse(sel_str) {
+-            Ok(sel) => {
+-                for el in doc.select(&sel) {
+-                    skip_ptrs.insert(el.value() as *const _);
+-                }
+-            }
++/// Parse each selector, reporting the ones that are not valid CSS instead of
++/// dropping them silently. Returns the valid ones with their original text.
++fn parse_selectors(
++    option: &str,
++    selectors: &[String],
++    warnings: &mut Vec<String>,
++) -> Vec<(String, Selector)> {
++    let mut parsed = Vec::with_capacity(selectors.len());
++    for raw in selectors {
++        match Selector::parse(raw) {
++            Ok(sel) => parsed.push((raw.clone(), sel)),
+             Err(e) => {
+-                tracing::warn!("Invalid CSS selector '{}': {:?}", sel_str, e);
++                tracing::warn!("Invalid CSS selector in {option} '{raw}': {e:?}");
++                warnings.push(format!(
++                    "invalid_selector: {option} {raw:?} is not valid CSS"
++                ));
+             }
+         }
+     }
++    parsed
++}
+ 
+-    if skip_ptrs.is_empty() {
+-        return html.to_string();
++/// Apply the caller's `include_tags` / `exclude_tags` to the whole document.
++///
++/// Every selector is matched against the full, untouched DOM, so descendant
++/// and child combinators, attribute operators, `:not()` and comma lists see
++/// the same tree a browser's `querySelectorAll` would. Then:
++///
++/// - each `exclude_tags` match is removed with its subtree;
++/// - with `include_tags`, only the matched elements are kept, in document
++///   order. An element inside another matched element is not emitted twice.
++///   Each one is wrapped in a `data-crw-include` div so the cleaning pass can
++///   tell it was selected (and unwraps it again).
++///
++/// No match at all returns an empty string with `selector_no_match` and a
++/// readable `include_tags_no_match` warning. It never falls back to the whole
++/// page: that silently fills an agent's context with everything it tried to
++/// exclude.
++fn apply_tag_selectors(
++    html: &str,
++    include_tags: &[String],
++    exclude_tags: &[String],
++    warnings: &mut Vec<String>,
++    report: &mut SelectorReport,
++) -> String {
++    let mut doc = Html::parse_document(html);
++    let include = parse_selectors("includeTags", include_tags, warnings);
++    let exclude = parse_selectors("excludeTags", exclude_tags, warnings);
++
++    let mut include_ids = HashSet::new();
++    for (raw, sel) in &include {
++        let mut count = 0;
++        for el in doc.select(sel) {
++            include_ids.insert(el.id());
++            count += 1;
++        }
++        report.include_matches.push((raw.clone(), count));
++    }
++    let exclude_ids: Vec<_> = exclude
++        .iter()
++        .flat_map(|(_, sel)| doc.select(sel).map(|el| el.id()).collect::<Vec<_>>())
++        .collect();
++    for id in &exclude_ids {
++        if let Some(mut node) = doc.tree.get_mut(*id) {
++            node.detach();
++        }
+     }
+ 
+-    // Re-serialize the root element, skipping excluded subtrees.
+-    // Pre-allocate output based on input size.
+-    let root = doc.root_element();
+-    let mut out = String::with_capacity(html.len());
+-    collect_excluding(&root, &skip_ptrs, &mut out);
+-    out
+-}
+-
+-fn is_excluded(
+-    el: &scraper::ElementRef,
+-    skip_ptrs: &HashSet<*const scraper::node::Element>,
+-) -> bool {
+-    let ptr = el.value() as *const scraper::node::Element;
+-    skip_ptrs.contains(&ptr)
+-}
++    if include_tags.is_empty() {
++        return if exclude_ids.is_empty() {
++            html.to_string()
++        } else {
++            doc.html()
++        };
++    }
+ 
+-fn collect_excluding(
+-    element: &scraper::ElementRef,
+-    skip_ptrs: &HashSet<*const scraper::node::Element>,
+-    out: &mut String,
+-) {
+-    if is_excluded(element, skip_ptrs) {
+-        return;
+-    }
+-
+-    let el = element.value();
+-    out.push('<');
+-    out.push_str(&el.name.local);
+-    for (name, value) in el.attrs() {
+-        out.push(' ');
+-        out.push_str(name);
+-        out.push_str("=\"");
+-        out.push_str(&value.replace('"', "&quot;"));
+-        out.push('"');
+-    }
+-    out.push('>');
+-
+-    for child in element.children() {
+-        match child.value() {
+-            scraper::node::Node::Text(text) => {
+-                out.push_str(text);
+-            }
+-            scraper::node::Node::Element(_) => {
+-                if let Some(child_el) = scraper::ElementRef::wrap(child) {
+-                    collect_excluding(&child_el, skip_ptrs, out);
+-                }
++    let total: usize = report.include_matches.iter().map(|(_, n)| n).sum();
++    if total > 0 {
++        for (raw, n) in &report.include_matches {
++            if *n == 0 {
++                warnings.push(format!(
++                    "include_tags_partial_match: includeTags {raw:?} matched 0 elements"
++                ));
+             }
+-            _ => {}
+         }
+     }
+ 
+-    let self_closing = matches!(
+-        &*el.name.local,
+-        "br" | "hr"
+-            | "img"
+-            | "input"
+-            | "meta"
+-            | "link"
+-            | "area"
+-            | "base"
+-            | "col"
+-            | "embed"
+-            | "source"
+-            | "track"
+-            | "wbr"
+-    );
+-    if !self_closing {
+-        out.push_str("</");
+-        out.push_str(&el.name.local);
+-        out.push('>');
++    // Walk the tree that is left after exclusion, so an included element
++    // inside an excluded one is gone too.
++    let mut parts = Vec::new();
++    for node in doc.root_element().descendants() {
++        if !include_ids.contains(&node.id()) {
++            continue;
++        }
++        if node.ancestors().any(|a| include_ids.contains(&a.id())) {
++            continue;
++        }
++        if let Some(el) = ElementRef::wrap(node) {
++            parts.push(format!("<div {INCLUDE_WRAPPER_ATTR}>{}</div>", el.html()));
++        }
++    }
++
++    if parts.is_empty() {
++        warnings.push("selector_no_match".to_string());
++        let detail = if total > 0 {
++            "every element it matched was removed by excludeTags".to_string()
++        } else {
++            let tried: Vec<String> = include_tags.iter().map(|s| format!("{s:?}")).collect();
++            format!("includeTags matched 0 elements ({})", tried.join(", "))
++        };
++        warnings.push(format!("include_tags_no_match: {detail}"));
++        return String::new();
+     }
++
++    parts.join("\n")
+ }
+ 
+ #[cfg(test)]
+@@ -1045,7 +1159,7 @@ mod tests {
+ 
+     #[test]
+     fn deeply_nested_divs_with_exclude_tags_selector_does_not_overflow() {
+-        // Exercises the recursive `collect_excluding` path at depth.
++        // exclude_tags on a deep tree: detaching and re-serializing must not recurse.
+         let depth = 300;
+         let mut html = String::from(r#"<body><div id="keep">"#);
+         for _ in 0..depth {
+@@ -1104,7 +1218,15 @@ mod tests {
+         )
+         .unwrap();
+         assert!(result.contains("Kept"));
+-        assert!(warnings.is_empty(), "a valid match must not warn");
++        assert!(
++            !warnings.iter().any(|w| w == "selector_no_match"),
++            "a valid match must not report no-match: {warnings:?}"
++        );
++        assert_eq!(
++            warnings,
++            vec![r#"invalid_selector: includeTags "[[[invalid" is not valid CSS"#.to_string()],
++            "the invalid selector is reported, not silently ignored"
++        );
+     }
+ 
+     #[test]
+@@ -1194,8 +1316,16 @@ mod tests {
+         .unwrap();
+         assert!(result.contains("Kept"));
+         assert!(
+-            warnings.is_empty(),
+-            "at least one selector matched, so no selector_no_match warning"
++            !warnings.iter().any(|w| w == "selector_no_match"),
++            "at least one selector matched, so no selector_no_match warning: {warnings:?}"
++        );
++        assert_eq!(
++            warnings,
++            vec![
++                r#"include_tags_partial_match: includeTags ".does-not-exist" matched 0 elements"#
++                    .to_string()
++            ],
++            "the selector that matched nothing is still named"
+         );
+     }
+ 
+diff --git a/crates/crw-extract/src/lib.rs b/crates/crw-extract/src/lib.rs
+index cf259fa..e31f89e 100644
+--- a/crates/crw-extract/src/lib.rs
++++ b/crates/crw-extract/src/lib.rs
+@@ -453,13 +453,14 @@ pub fn extract(opts: ExtractOptions<'_>) -> CrwResult<ScrapeData> {
+     let treat_as_plain = !crw_core::is_html_like_content_type(content_type);
+ 
+     // Step 1: Extract metadata from raw HTML.
+-    let meta = readability::extract_metadata(raw_html);
++    let mut meta = readability::extract_metadata(raw_html);
++    let mut selector_report = clean::SelectorReport::default();
+ 
+     // Steps 2-4 (clean / selector / readability narrowing) only make sense on
+     // real markup. For a non-HTML body, `raw_html` already IS the content —
+     // none of the markup-aware selection below has anything to select against.
+-    let (content_html, cleaned_ref, had_selection, include_tags_no_match) = if treat_as_plain {
+-        (raw_html.to_string(), None, false, false)
++    let (content_html, cleaned_ref, had_selection) = if treat_as_plain {
++        (raw_html.to_string(), None, false)
+     } else {
+         // Step 2: Clean HTML (remove boilerplate, nav, ads, etc.).
+         // `include_tags` narrowing happens inside clean_html; when it matches
+@@ -467,17 +468,34 @@ pub fn extract(opts: ExtractOptions<'_>) -> CrwResult<ScrapeData> {
+         // Capture that here (via the warning delta this call produced) so the rest
+         // of the pipeline can treat it exactly like an unmatched css/xpath selector.
+         let warns_before = warnings.len();
+-        let cleaned = clean::clean_html_with_warnings(
++        // Never fall back to `raw_html` itself: that ships every <style> and
++        // <script> body into the markdown.
++        let cleaned = match clean::clean_html_with_report(
+             raw_html,
+             only_main_content,
+             include_tags,
+             exclude_tags,
+             &mut warnings,
+-        )
+-        .unwrap_or_else(|_| raw_html.to_string());
++            &mut selector_report,
++        ) {
++            Ok(c) => c,
++            Err(e) => {
++                tracing::warn!(url = %source_url, "HTML cleaning failed: {e}");
++                warnings.push(format!("clean_failed: {e}"));
++                if include_tags.is_empty() {
++                    clean::strip_non_content(raw_html)
++                } else {
++                    String::new()
++                }
++            }
++        };
+         let include_tags_no_match = warnings[warns_before..]
+             .iter()
+             .any(|w| w == "selector_no_match");
++        // A successful include_tags narrowing is the caller saying exactly what
++        // they want, the same as a css/xpath selector: what it matched is the
++        // content, and nothing below may widen it or swap it out.
++        let include_tags_matched = !include_tags.is_empty() && !include_tags_no_match;
+ 
+         // Step 3: Apply CSS/XPath selector if provided (narrows to a specific element).
+         let selected_html = apply_selector(&cleaned, css_selector, xpath)?;
+@@ -505,32 +523,50 @@ pub fn extract(opts: ExtractOptions<'_>) -> CrwResult<ScrapeData> {
+         let after_selection = selected_html.as_deref().unwrap_or(&cleaned);
+ 
+         // Step 4: If only_main_content, try to narrow further with readability scoring.
+-        let (content_html, cleaned_ref) = if only_main_content && selected_html.is_none() {
+-            match readability::extract_main_content_with_provenance(after_selection) {
+-                readability::ReadabilityOutcome::Selected { html: main, .. } => {
+-                    // Re-clean: readability may have selected a broad container
+-                    // (e.g. <article>) that still contains noise elements
+-                    // (infobox, navbox, catlinks, etc.).
+-                    let re_cleaned = clean::clean_html(&main, true, &[], &[]).unwrap_or(main);
+-                    (re_cleaned, Some(cleaned))
+-                }
+-                readability::ReadabilityOutcome::Rejected { .. } => {
+-                    // Listing root or empty body — skip readability and let the
+-                    // alternates ladder pick from cleaned / basic-clean.
+-                    (cleaned.clone(), Some(cleaned))
++        // Not after an include_tags narrowing: readability would pick one of the
++        // selected elements and drop the rest (e.g. one price out of a list).
++        let (content_html, cleaned_ref) =
++            if only_main_content && selected_html.is_none() && !include_tags_matched {
++                match readability::extract_main_content_with_provenance(after_selection) {
++                    readability::ReadabilityOutcome::Selected { html: main, .. } => {
++                        // Re-clean: readability may have selected a broad container
++                        // (e.g. <article>) that still contains noise elements
++                        // (infobox, navbox, catlinks, etc.).
++                        let re_cleaned = clean::clean_html(&main, true, &[], &[]).unwrap_or(main);
++                        (re_cleaned, Some(cleaned))
++                    }
++                    readability::ReadabilityOutcome::Rejected { .. } => {
++                        // Listing root or empty body — skip readability and let the
++                        // alternates ladder pick from cleaned / basic-clean.
++                        (cleaned.clone(), Some(cleaned))
++                    }
+                 }
+-            }
+-        } else {
+-            (after_selection.to_string(), None)
+-        };
++            } else {
++                (after_selection.to_string(), None)
++            };
+         (
+             content_html,
+             cleaned_ref,
+-            selected_html.is_some(),
+-            include_tags_no_match,
++            // Skips the alternates ladder below. Without this, a short
++            // include_tags result (a list of prices) scored as low quality and
++            // lost to a whole-page or captured-XHR candidate: the caller got a
++            // cookie banner's CSS instead of what they selected.
++            selected_html.is_some() || include_tags_matched,
+         )
+     };
+ 
++    if !selector_report.include_matches.is_empty() {
++        let counts: serde_json::Map<String, serde_json::Value> = selector_report
++            .include_matches
++            .iter()
++            .map(|(sel, n)| (sel.clone(), serde_json::Value::from(*n)))
++            .collect();
++        meta.extra.insert(
++            "includeTagsMatches".to_string(),
++            serde_json::Value::Object(counts),
++        );
++    }
++
+     // Step 5: Produce requested formats. `Summary` also needs markdown
+     // internally — the summary path feeds the markdown into the LLM and then
+     // strips it from the response unless the caller also asked for markdown.
+@@ -592,7 +628,7 @@ pub fn extract(opts: ExtractOptions<'_>) -> CrwResult<ScrapeData> {
+                     exclude_tags,
+                     &mut warnings,
+                 )
+-                .unwrap_or_else(|_| raw_html.to_string());
++                .unwrap_or_else(|_| clean::strip_non_content(raw_html));
+                 let chrome_md = markdown::html_to_markdown_with(&chrome_cleaned, normalize_tables);
+ 
+                 // Structural chrome removal has to be able to back out. Page
+@@ -627,7 +663,7 @@ pub fn extract(opts: ExtractOptions<'_>) -> CrwResult<ScrapeData> {
+                         exclude_tags,
+                         &mut warnings,
+                     )
+-                    .unwrap_or_else(|_| raw_html.to_string());
++                    .unwrap_or_else(|_| clean::strip_non_content(raw_html));
+                     let structural_md =
+                         markdown::html_to_markdown_with(&structural, normalize_tables);
+                     if structural_md.len() * STRUCTURAL_SURVIVAL_FLOOR < chrome_md.len() {
+@@ -757,9 +793,9 @@ pub fn extract(opts: ExtractOptions<'_>) -> CrwResult<ScrapeData> {
+         if treat_as_plain {
+             return m;
+         }
+-        // A narrowing that matched nothing is intentionally empty; padding it
+-        // with the page title would re-leak content the caller narrowed away.
+-        if user_selected || include_tags_no_match {
++        // A narrowing is exactly what the caller asked for, matched or empty;
++        // padding it with the page title would add content they narrowed away.
++        if user_selected || !include_tags.is_empty() {
+             return m;
+         }
+         let title = meta
+@@ -822,7 +858,7 @@ pub fn extract(opts: ExtractOptions<'_>) -> CrwResult<ScrapeData> {
+         if treat_as_plain {
+             return m;
+         }
+-        if user_selected || include_tags_no_match {
++        if user_selected || !include_tags.is_empty() {
+             return m;
+         }
+         if m.len() >= 1500 {
+@@ -999,6 +1035,11 @@ pub fn extract(opts: ExtractOptions<'_>) -> CrwResult<ScrapeData> {
+         None
+     };
+ 
++    // The candidate ladder re-cleans the page with the same selectors, which
++    // repeats any selector warning. Keep the first of each.
++    let mut seen_warnings = std::collections::HashSet::new();
++    warnings.retain(|w| seen_warnings.insert(w.clone()));
++
+     Ok(ScrapeData {
+         markdown: md,
+         // Set at the scrape choke point (crw-crawl::single::scrape_url) where
+@@ -1106,7 +1147,7 @@ fn extract_xhr_text(captured: &[CapturedNetworkResponse]) -> Option<String> {
+             Err(_) => continue,
+         };
+         walk_json_strings(&value, &mut |s| {
+-            if s.len() >= MIN_FIELD_LEN && seen.insert(s.to_string()) {
++            if s.len() >= MIN_FIELD_LEN && looks_like_prose(s) && seen.insert(s.to_string()) {
+                 paragraphs.push(s.to_string());
+             }
+         });
+@@ -1122,6 +1163,52 @@ fn extract_xhr_text(captured: &[CapturedNetworkResponse]) -> Option<String> {
+     Some(joined)
+ }
+ 
++/// Whether a captured JSON string reads like text a person wrote, rather than
++/// something a page ships for its own machinery. Consent managers (OneTrust,
++/// Cookiebot, ...) load their banner as JSON full of style sheets, signed
++/// tokens and base64 HTML templates; long strings like those used to be
++/// harvested as "article text" and could win the candidate ladder outright.
++fn looks_like_prose(s: &str) -> bool {
++    let s = s.trim();
++    // Markup anywhere: an HTML fragment or template, not text.
++    let bytes = s.as_bytes();
++    if bytes
++        .windows(2)
++        .any(|w| w[0] == b'<' && (w[1].is_ascii_alphabetic() || w[1] == b'/' || w[1] == b'!'))
++    {
++        return false;
++    }
++    // CSS rule blocks: `selector { prop: value; }`.
++    if s.contains('{') && s.contains('}') && s.contains(':') && s.contains(';') {
++        return false;
++    }
++    let words: Vec<&str> = s.split_whitespace().collect();
++    // Prose has words; a JWT, a base64 blob, a hash or a URL list has few or none.
++    if words.len() < 8 {
++        return false;
++    }
++    let letters = s.chars().filter(|c| c.is_alphabetic()).count();
++    let total = s.chars().count().max(1);
++    if letters * 2 < total {
++        return false;
++    }
++    // Any single token this long is encoded data (base64, a token, minified code).
++    if words.iter().any(|w| w.chars().count() > 60) {
++        return false;
++    }
++    // Code-ish punctuation density: function bodies, JSON-in-a-string, regexes.
++    let code_punct = s
++        .chars()
++        .filter(|c| {
++            matches!(
++                c,
++                '{' | '}' | '[' | ']' | '(' | ')' | ';' | '=' | '<' | '>' | '\\' | '|'
++            )
++        })
++        .count();
++    code_punct * 20 <= total
++}
++
+ fn walk_json_strings(value: &serde_json::Value, on_string: &mut dyn FnMut(&str)) {
+     match value {
+         serde_json::Value::String(s) => {
+@@ -1223,11 +1310,15 @@ mod private_tests {
+ 
+     #[test]
+     fn xhr_extract_collects_long_string_fields() {
++        // Long fields must read as prose to count (see `looks_like_prose`).
++        let a = "Alpha paragraph text about the article body. ".repeat(7);
++        let b = "Bravo summary sentence for the meta field. ".repeat(5);
++        let c = "Charlie tag description that is long enough. ".repeat(4);
+         let body = serde_json::json!({
+             "title": "short",
+-            "body": "a".repeat(300),
+-            "meta": { "summary": "b".repeat(200) },
+-            "tags": ["c".repeat(150), "short"],
++            "body": a,
++            "meta": { "summary": b },
++            "tags": [c, "short"],
+             "url": "https://example.com/should/skip",
+         })
+         .to_string();
+@@ -1240,9 +1331,9 @@ mod private_tests {
+             body_size_bytes: 800,
+         }];
+         let got = extract_xhr_text(&resp).expect("expected long-text fields");
+-        assert!(got.contains(&"a".repeat(300)));
+-        assert!(got.contains(&"b".repeat(200)));
+-        assert!(got.contains(&"c".repeat(150)));
++        assert!(got.contains(a.trim()));
++        assert!(got.contains(b.trim()));
++        assert!(got.contains(c.trim()));
+         assert!(!got.contains("short"));
+         assert!(!got.contains("example.com/should/skip"));
+     }
+diff --git a/crates/crw-extract/tests/selector_tests.rs b/crates/crw-extract/tests/selector_tests.rs
+new file mode 100644
+index 0000000..5e804c5
+--- /dev/null
++++ b/crates/crw-extract/tests/selector_tests.rs
+@@ -0,0 +1,459 @@
++//! `includeTags` / `excludeTags` take any standard CSS selector, match against
++//! the whole rendered document, report what they matched, and never let page
++//! machinery (style sheets, scripts, templates, consent-banner JSON) into the
++//! output.
++
++use crw_core::types::{CapturedNetworkResponse, OutputFormat};
++use crw_extract::ExtractOptions;
++use crw_extract::clean::{SelectorReport, clean_html_with_report};
++
++/// A listing page shaped like the ones that broke: cards with data attributes,
++/// a price nested two levels down, a cookie banner with an inline style sheet,
++/// a client-side template and a JSON blob in a script.
++const LISTING: &str = r#"<!doctype html><html><head><title>Vans for sale - Example</title>
++<style>#onetrust-banner-sdk { border-radius: 8px; }</style></head><body>
++<header class="site-header"><div class="promo-strip" data-cmp="deal">Header deal $1</div></header>
++<div id="onetrust-consent-sdk"><style id="onetrust-style">#onetrust-banner-sdk .x{color:red;}</style>
++  <div id="onetrust-banner-sdk"><p>We use cookies to improve your experience.</p></div></div>
++<main>
++  <div data-cmp="inventoryListing" class="card">
++    <h2 data-cmp="title">2024 Van A</h2>
++    <div data-cmp="pricing"><span class="price" data-cmp="firstPrice">33,293</span></div>
++    <div class="ad-slot">Sponsored</div>
++  </div>
++  <div data-cmp="inventoryListing" class="card featured">
++    <h2 data-cmp="title">2024 Van B</h2>
++    <div data-cmp="pricing"><span class="price" data-cmp="firstPrice">34,949</span></div>
++  </div>
++  <aside class="card promo" data-cmp="inventorySponsored">
++    <div data-cmp="pricing"><span class="price" data-cmp="firstPrice">29,999</span></div>
++  </aside>
++</main>
++<template id="card-tpl"><div class="card">{{title}} {{price}}</div></template>
++<script type="text/template"><div>PGRpdj5iYXNlNjQgdGVtcGxhdGU8L2Rpdj4=</div></script>
++<script type="application/json">{"token":"eyJhbGciOiJSUzUxMiJ9.eyJzdWIiOiJ4In0.c2ln"}</script>
++<noscript>Please enable JavaScript</noscript>
++</body></html>"#;
++
++fn tags(list: &[&str]) -> Vec<String> {
++    list.iter().map(|s| s.to_string()).collect()
++}
++
++fn clean(
++    only_main_content: bool,
++    include: &[&str],
++    exclude: &[&str],
++) -> (String, Vec<String>, SelectorReport) {
++    let mut warnings = Vec::new();
++    let mut report = SelectorReport::default();
++    let out = clean_html_with_report(
++        LISTING,
++        only_main_content,
++        &tags(include),
++        &tags(exclude),
++        &mut warnings,
++        &mut report,
++    )
++    .unwrap();
++    (out, warnings, report)
++}
++
++fn assert_no_machinery(out: &str) {
++    for leak in [
++        "border-radius",
++        "color:red",
++        "{{title}}",
++        "PGRpdj5i",
++        "eyJhbGci",
++        "Please enable JavaScript",
++    ] {
++        assert!(!out.contains(leak), "leaked {leak:?} into: {out}");
++    }
++}
++
++// ── item 1: full CSS selectors ───────────────────────────────────────────────
++
++#[test]
++fn descendant_attribute_selector_matches() {
++    let (out, warnings, _) = clean(
++        true,
++        &[r#"[data-cmp="inventoryListing"] [data-cmp="firstPrice"]"#],
++        &[],
++    );
++    assert!(
++        out.contains("33,293") && out.contains("34,949"),
++        "got: {out}"
++    );
++    assert!(
++        !out.contains("Van A"),
++        "only the prices were selected: {out}"
++    );
++    assert!(warnings.is_empty(), "{warnings:?}");
++}
++
++#[test]
++fn prefix_attribute_descendant_selector_matches() {
++    // The exact shape from the bug report: "[data-a^='x'] [data-b='y']".
++    let (out, _, _) = clean(
++        true,
++        &["[data-cmp^='inventory'] [data-cmp='firstPrice']"],
++        &[],
++    );
++    assert!(
++        out.contains("33,293") && out.contains("34,949") && out.contains("29,999"),
++        "got: {out}"
++    );
++}
++
++#[test]
++fn child_combinator_with_classes_matches() {
++    let (out, _, _) = clean(true, &["div.card > h2"], &[]);
++    assert!(
++        out.contains("2024 Van A") && out.contains("2024 Van B"),
++        "got: {out}"
++    );
++    assert!(
++        !out.contains("33,293"),
++        "child combinator must not reach grandchildren: {out}"
++    );
++}
++
++#[test]
++fn suffix_contains_and_not_selectors_match() {
++    let (out, _, report) = clean(
++        true,
++        &[
++            "[data-cmp$='Listing'] [data-cmp*='Price']",
++            ".card:not(.featured) > [data-cmp='title']",
++        ],
++        &[],
++    );
++    assert!(out.contains("33,293"), "got: {out}");
++    assert!(out.contains("2024 Van A"), "got: {out}");
++    assert!(
++        !out.contains("2024 Van B"),
++        ":not(.featured) must exclude Van B: {out}"
++    );
++    assert_eq!(report.include_matches[0].1, 2);
++    assert_eq!(report.include_matches[1].1, 1);
++}
++
++#[test]
++fn comma_list_is_one_selector_and_keeps_document_order() {
++    let (out, _, report) = clean(false, &["[data-cmp='firstPrice'], [data-cmp='title']"], &[]);
++    let a = out.find("2024 Van A").unwrap();
++    let pa = out.find("33,293").unwrap();
++    let b = out.find("2024 Van B").unwrap();
++    assert!(a < pa && pa < b, "expected document order, got: {out}");
++    assert_eq!(
++        report.include_matches,
++        vec![("[data-cmp='firstPrice'], [data-cmp='title']".to_string(), 5)]
++    );
++}
++
++#[test]
++fn nested_matches_are_not_emitted_twice() {
++    let (out, _, _) = clean(
++        false,
++        &["[data-cmp='inventoryListing']", "[data-cmp='firstPrice']"],
++        &[],
++    );
++    assert_eq!(out.matches("33,293").count(), 1, "got: {out}");
++    // The aside's price is only matched by the second selector, so it appears once too.
++    assert_eq!(out.matches("29,999").count(), 1, "got: {out}");
++}
++
++#[test]
++fn selectors_see_elements_the_boilerplate_rules_would_remove() {
++    // With onlyMainContent the cleaner drops <header>, <aside> and `.promo`.
++    // A selector naming something inside them must still match: selection runs
++    // on the full document first, and a selected element is never removed.
++    let (out, warnings, _) = clean(true, &["header [data-cmp='deal']", "aside.promo"], &[]);
++    assert!(out.contains("Header deal $1"), "got: {out}");
++    assert!(out.contains("29,999"), "got: {out}");
++    assert!(warnings.is_empty(), "{warnings:?}");
++}
++
++#[test]
++fn boilerplate_inside_a_selection_is_still_cleaned() {
++    let (out, _, _) = clean(true, &["[data-cmp='inventoryListing']"], &[]);
++    assert!(out.contains("33,293"), "got: {out}");
++    assert!(
++        !out.contains("Sponsored"),
++        "the ad slot inside the card is still noise: {out}"
++    );
++}
++
++#[test]
++fn exclude_tags_take_descendant_selectors_across_the_selection() {
++    let (out, _, _) = clean(
++        false,
++        &["[data-cmp='inventoryListing']"],
++        &["main .featured [data-cmp='pricing']"],
++    );
++    assert!(out.contains("33,293"), "got: {out}");
++    assert!(out.contains("2024 Van B"), "got: {out}");
++    assert!(!out.contains("34,949"), "excluded price leaked: {out}");
++}
++
++#[test]
++fn selector_strings_are_not_split_on_spaces_or_commas() {
++    let (_, _, report) = clean(false, &["main  div.card , aside.promo"], &[]);
++    assert_eq!(report.include_matches.len(), 1);
++    assert_eq!(report.include_matches[0].0, "main  div.card , aside.promo");
++    assert_eq!(report.include_matches[0].1, 3);
++}
++
++// ── item 2: zero matches fail clearly ────────────────────────────────────────
++
++#[test]
++fn zero_matches_return_empty_and_say_so() {
++    let (out, warnings, report) = clean(true, &[".does-not-exist", "#nope"], &[]);
++    assert!(out.is_empty(), "must not fall back to other content: {out}");
++    assert!(
++        warnings.iter().any(|w| w == "selector_no_match"),
++        "{warnings:?}"
++    );
++    assert!(
++        warnings
++            .iter()
++            .any(|w| w.starts_with("include_tags_no_match: includeTags matched 0 elements")),
++        "{warnings:?}"
++    );
++    assert_eq!(
++        report.include_matches,
++        vec![(".does-not-exist".to_string(), 0), ("#nope".to_string(), 0)]
++    );
++}
++
++#[test]
++fn a_selector_that_matched_nothing_beside_one_that_did_is_reported() {
++    let (out, warnings, _) = clean(true, &["[data-cmp='firstPrice']", ".missing"], &[]);
++    assert!(out.contains("33,293"));
++    assert!(
++        warnings.iter().any(
++            |w| w == r#"include_tags_partial_match: includeTags ".missing" matched 0 elements"#
++        ),
++        "{warnings:?}"
++    );
++}
++
++#[test]
++fn invalid_selectors_are_reported_not_ignored() {
++    let (out, warnings, report) = clean(true, &["div[[", "[data-cmp='title']"], &["!!"]);
++    assert!(out.contains("2024 Van A"));
++    assert!(
++        warnings
++            .iter()
++            .any(|w| w == r#"invalid_selector: includeTags "div[[" is not valid CSS"#),
++        "{warnings:?}"
++    );
++    assert!(
++        warnings
++            .iter()
++            .any(|w| w == r#"invalid_selector: excludeTags "!!" is not valid CSS"#),
++        "{warnings:?}"
++    );
++    assert_eq!(
++        report.include_matches,
++        vec![("[data-cmp='title']".to_string(), 2)]
++    );
++}
++
++#[test]
++fn everything_matched_but_excluded_is_a_clear_no_match() {
++    let (out, warnings, _) = clean(false, &["[data-cmp='firstPrice']"], &["main"]);
++    assert!(out.is_empty(), "got: {out}");
++    assert!(
++        warnings
++            .iter()
++            .any(|w| w.contains("removed by excludeTags")),
++        "{warnings:?}"
++    );
++}
++
++// ── item 3: no style / script / template text, in any mode ──────────────────
++
++#[test]
++fn machinery_never_survives_cleaning() {
++    for only_main_content in [true, false] {
++        let (out, _, _) = clean(only_main_content, &[], &[]);
++        assert_no_machinery(&out);
++        assert!(out.contains("33,293"));
++        let (out, _, _) = clean(only_main_content, &["body"], &[]);
++        assert_no_machinery(&out);
++        let (out, _, _) = clean(only_main_content, &["template", "noscript", "style"], &[]);
++        assert_no_machinery(&out);
++    }
++}
++
++#[test]
++fn consent_banners_are_removed_by_default_and_kept_on_request() {
++    let (out, _, _) = clean(true, &[], &[]);
++    assert!(!out.contains("We use cookies"), "got: {out}");
++    // onlyMainContent: false keeps the page as it is, banner included.
++    let (out, _, _) = clean(false, &[], &[]);
++    assert!(out.contains("We use cookies"), "got: {out}");
++}
++
++#[test]
++fn consent_managers_without_cookie_or_consent_in_their_names_are_removed() {
++    for container in [
++        r#"<div class="osano-cm-window"><div class="osano-cm-dialog">BANNER</div></div>"#,
++        r#"<div id="qc-cmp2-container">BANNER</div>"#,
++        r#"<div id="didomi-host">BANNER</div>"#,
++        r#"<div id="usercentrics-root">BANNER</div>"#,
++        r#"<div id="sp_message_container_123456">BANNER</div>"#,
++        r#"<div id="iubenda-cs-banner">BANNER</div>"#,
++    ] {
++        let html = format!("<body>{container}<main><p>The article.</p></main></body>");
++        let out = crw_extract::clean::clean_html(&html, true, &[], &[]).unwrap();
++        assert!(!out.contains("BANNER"), "{container} survived: {out}");
++        assert!(out.contains("The article."), "{out}");
++        let kept = crw_extract::clean::clean_html(&html, false, &[], &[]).unwrap();
++        assert!(
++            kept.contains("BANNER"),
++            "onlyMainContent: false keeps it: {kept}"
++        );
++    }
++}
++
++// ── through the whole extraction pipeline ───────────────────────────────────
++
++fn extract(
++    include: &[&str],
++    only_main_content: bool,
++    formats: &[OutputFormat],
++    captured: &[CapturedNetworkResponse],
++) -> crw_core::types::ScrapeData {
++    let include = tags(include);
++    crw_extract::extract(ExtractOptions {
++        raw_html: LISTING,
++        content_type: None,
++        source_url: "https://cars.example.com/vans",
++        status_code: 200,
++        rendered_with: Some("chrome".into()),
++        elapsed_ms: 0,
++        render_decision: None,
++        credit_cost: 0,
++        warnings: Vec::new(),
++        formats,
++        only_main_content,
++        include_tags: &include,
++        exclude_tags: &[],
++        css_selector: None,
++        xpath: None,
++        chunk_strategy: None,
++        query: None,
++        filter_mode: None,
++        top_k: None,
++        domain_selectors: None,
++        captured_responses: captured,
++        llm_fallback: None,
++        debug: false,
++        debug_sink: None,
++        normalize_tables: false,
++    })
++    .unwrap()
++}
++
++/// What a consent manager loads over XHR: long strings of CSS, a signed token
++/// and a base64 HTML template. Before the fix these won the candidate ladder.
++fn consent_xhr() -> Vec<CapturedNetworkResponse> {
++    let css = "#onetrust-banner-sdk .ot-sdk-container { width: 100%; padding: 0; } \
++               #onetrust-policy-text { font-size: 16px; line-height: 1.5; color: #414C58; } "
++        .repeat(20);
++    let jwt = format!(
++        "eyJhbGciOiJSUzUxMiJ9.{}.{}",
++        "eyJvdEp3dFZlcnNpb24iOjF9".repeat(10),
++        "c2lnbmF0dXJl".repeat(8)
++    );
++    let b64 = "PGRpdiBjbGFzcz0ib3QtYmFubmVyIj48cD5XZSB1c2UgY29va2llczwvcD48L2Rpdj4=".repeat(12);
++    let body = serde_json::json!({ "css": css, "token": jwt, "html": b64 }).to_string();
++    vec![CapturedNetworkResponse {
++        url: "https://cdn.cookielaw.example/consent/banner.json".into(),
++        request_id: "1".into(),
++        status: 200,
++        mime_type: Some("application/json".into()),
++        body_size_bytes: body.len(),
++        body: Some(body),
++    }]
++}
++
++#[test]
++fn a_short_include_tags_result_is_not_swapped_for_other_content() {
++    let data = extract(
++        &["[data-cmp='inventoryListing'] [data-cmp='firstPrice']"],
++        true,
++        &[OutputFormat::Markdown],
++        &consent_xhr(),
++    );
++    let md = data.markdown.unwrap();
++    assert!(md.contains("33,293") && md.contains("34,949"), "got: {md}");
++    assert_no_machinery(&md);
++    assert!(!md.contains("onetrust"), "consent XHR leaked: {md}");
++    // No title or description padding around an explicit selection.
++    assert!(!md.contains("Vans for sale"), "got: {md}");
++    let counts = data
++        .metadata
++        .extra
++        .get("includeTagsMatches")
++        .expect("match counts in metadata");
++    assert_eq!(
++        counts,
++        &serde_json::json!({ "[data-cmp='inventoryListing'] [data-cmp='firstPrice']": 2 })
++    );
++}
++
++#[test]
++fn zero_include_matches_give_empty_content_and_a_warning_end_to_end() {
++    let data = extract(
++        &[".nothing-here"],
++        true,
++        &[OutputFormat::Markdown],
++        &consent_xhr(),
++    );
++    assert_eq!(data.markdown.as_deref().map(str::trim), Some(""));
++    assert!(
++        data.warnings.iter().any(|w| w == "selector_no_match"),
++        "{:?}",
++        data.warnings
++    );
++    assert!(
++        data.warnings
++            .iter()
++            .any(|w| w.contains("includeTags matched 0 elements")),
++        "{:?}",
++        data.warnings
++    );
++    assert_eq!(
++        data.metadata.extra.get("includeTagsMatches"),
++        Some(&serde_json::json!({ ".nothing-here": 0 }))
++    );
++}
++
++#[test]
++fn consent_xhr_never_reaches_markdown_html_or_text() {
++    // A page with almost no text forces the alternates ladder, where the XHR
++    // candidate used to win with the banner's CSS and tokens.
++    let formats = [
++        OutputFormat::Markdown,
++        OutputFormat::Html,
++        OutputFormat::PlainText,
++    ];
++    for only_main_content in [true, false] {
++        let data = extract(&[], only_main_content, &formats, &consent_xhr());
++        for out in [
++            data.markdown.unwrap_or_default(),
++            data.html.unwrap_or_default(),
++            data.plain_text.unwrap_or_default(),
++        ] {
++            assert_no_machinery(&out);
++            assert!(
++                !out.contains("ot-sdk-container"),
++                "consent CSS leaked: {out}"
++            );
++            assert!(!out.contains("eyJvdEp3"), "token leaked: {out}");
++        }
++    }
++}
+diff --git a/crates/crw-renderer/src/lib.rs b/crates/crw-renderer/src/lib.rs
+index 762a279..4b1bba7 100644
+--- a/crates/crw-renderer/src/lib.rs
++++ b/crates/crw-renderer/src/lib.rs
+@@ -1773,6 +1773,19 @@ impl FallbackRenderer {
+     /// playwright is never chosen: it has no `RendererKind`, so a render on it
+     /// carries no breaker, no `renderDecision` and no `creditCost`. It stays
+     /// reachable through the auto chain and an explicit pin, as before.
++    /// The tier after `name` in the auto ladder: where a page that `name`
++    /// rendered but that came out empty gets its one second try. `None` when
++    /// `name` is the last tier or not in the ladder. playwright is skipped for
++    /// the reason given on [`Self::lightpanda_escalation_target`].
++    pub fn next_tier_after(&self, name: &str) -> Option<&str> {
++        let ladder = self.auto_ladder_names();
++        let pos = ladder.iter().position(|n| *n == name)?;
++        ladder[pos + 1..]
++            .iter()
++            .copied()
++            .find(|n| *n != "playwright")
++    }
++
+     pub fn lightpanda_escalation_target(&self) -> Option<&str> {
+         let ladder = self.auto_ladder_names();
+         ladder
+diff --git a/crates/crw-server/src/routes/mcp.rs b/crates/crw-server/src/routes/mcp.rs
+index d4154e1..5667c8b 100644
+--- a/crates/crw-server/src/routes/mcp.rs
++++ b/crates/crw-server/src/routes/mcp.rs
+@@ -216,6 +216,7 @@ async fn call_tool_inner(state: &AppState, tool_name: &str, args: Value) -> Resu
+             let source = crw_crawl::pdf::PdfSource {
+                 source_url: format!("upload://{}", filename.as_deref().unwrap_or("document.pdf")),
+                 status_code: 200,
++                content_type: None,
+                 elapsed_ms: 0,
+                 source_filename: filename,
+             };
+diff --git a/crates/crw-server/src/routes/v2/parse.rs b/crates/crw-server/src/routes/v2/parse.rs
+index 6a3db5b..bb768d3 100644
+--- a/crates/crw-server/src/routes/v2/parse.rs
++++ b/crates/crw-server/src/routes/v2/parse.rs
+@@ -166,6 +166,7 @@ pub async fn parse(
+     let source = PdfSource {
+         source_url: format!("upload://{}", filename.as_deref().unwrap_or("document.pdf")),
+         status_code: 200,
++        content_type: None,
+         elapsed_ms: 0,
+         source_filename: filename,
+     };
+-- 
+2.31.1.windows.1
+

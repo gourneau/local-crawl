@@ -16,11 +16,13 @@ name: local-crawl
 
 services:
   crw:
-    # fastCRW built from its release tag with the optional Camoufox tier compiled in.
-    # The published image (ghcr.io/fastcrw/crw) only has the cdp + impersonated features.
-    image: local-crawl/crw:0.37.2-stealth
+    # fastCRW v0.37.2 plus the fixes in docker/crw-patches, built with fastCRW's own
+    # Dockerfile and the optional Camoufox tier compiled in (the published image,
+    # ghcr.io/fastcrw/crw, only has the cdp + impersonated features). setup.ps1 -Docker
+    # checks the source out into build/crw-src and applies the patches first.
+    image: local-crawl/crw:0.37.2-fixes
     build:
-      context: https://github.com/fastcrw/crw.git#v0.37.2
+      context: ../build/crw-src
       args:
         CARGO_PKGS: "-p crw-server --features cdp,impersonated,camoufox"
     ports:
@@ -70,7 +72,8 @@ services:
     pids_limit: 256
     environment:
       - SEARXNG_BASE_URL=http://searxng:8080/
-      - SEARXNG_SECRET_KEY=${SEARXNG_SECRET_KEY}
+      # SearXNG reads SEARXNG_SECRET; docker/.env names it SEARXNG_SECRET_KEY.
+      - SEARXNG_SECRET=${SEARXNG_SECRET_KEY}
     volumes:
       - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
     tmpfs:

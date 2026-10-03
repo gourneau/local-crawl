@@ -83,6 +83,7 @@ There are two ways to run it. Switch in the tray (**Options → Local engine / D
 | JavaScript pages | your real Chrome, through the filter | the same real Chrome, through the same filter |
 | Last resort | none | **Camoufox**, an anti-detect Firefox |
 | Web search (`/v1/search`, `crw_search`) | no | **yes** (SearXNG) |
+| Scrape fixes ([below](#fixes-on-top-of-fastcrw)) | no, the official release | **yes** |
 | Extra memory | none | about 1–2 GB for the containers |
 
 The Docker engine is fastCRW's [self-hosting stack](https://docs.fastcrw.com/self-hosting/), rebuilt with the Camoufox tier compiled in. Its Chrome tier points at your PC's real Chrome instead of fastCRW's browsers, because that measured far better:
@@ -101,6 +102,19 @@ Network fingerprint ([tls.peet.ws](https://tls.peet.ws/api/all)):
 | crw plain HTTP (both engines) | `t13d1011h2_61a7ad8aa9b6_…` | `9b5dcd07…` | no |
 | `impersonated-http` (Docker engine) | `t13d1516h2_8daaf6152771_…` | `52d84b11…` | **yes** |
 | Chrome (both engines) | genuine | genuine | yes, it is Chrome |
+
+### Fixes on top of fastCRW
+
+The Docker engine's crw is fastCRW v0.37.2 plus the patch in [`docker/crw-patches`](docker/crw-patches), which `.\setup.ps1 -Docker` applies before building. It fixes problems an AI client hit while scraping:
+
+- **`includeTags` / `excludeTags` take any CSS selector**, including descendant and child combinators, attribute operators and `:not()`, and comma lists. Selectors run on the whole rendered page before crw's cleanup. Before, a selection that found only a few short items scored as "low quality" and was swapped for other content, so asking for the prices on a listing page returned a cookie banner's CSS instead.
+- **A selector that matches nothing says so.** You get empty content and the warnings `selector_no_match` plus `include_tags_no_match: includeTags matched 0 elements (...)`. Invalid selectors and selectors that matched nothing beside ones that did each get their own warning. `metadata.includeTagsMatches` gives the count for each selector.
+- **No page machinery in the output.** `<style>`, `<script>`, `<noscript>` and `<template>` contents never reach markdown, HTML or text. JSON a page loads in the background is only used when it reads as prose, so consent-manager CSS, tokens and base64 templates stay out. Cookie banners (OneTrust, Cookiebot and the like) are removed when `onlyMainContent` is on, which is the default; set it to `false` to keep them.
+- **An empty page gets a second try and a warning.** A 200 page with (almost) no text is retried once with the next renderer, then returned with an `empty_content` warning that lists the renderers tried.
+- **An empty renderer URL switches that renderer off.** fastCRW kept trying LightPanda with a blank URL on every JavaScript page before falling back to Chrome.
+- **Clearer "not a PDF" warnings.** They now include the HTTP status, the Content-Type, the size, and the page title or first characters, so a block page reads differently from a damaged file.
+
+The local engine still runs the official Windows release, so it doesn't have these fixes.
 
 ## Requirements
 
@@ -366,10 +380,12 @@ start.cmd, stop.cmd double-click wrappers
 tray\               tray app source (C#) and install.ps1
 filter\             DevTools filter source (C#), built into bin\cdp-filter.exe by setup.ps1
 docker\             the Docker engine: compose.yml, crw config, SearXNG settings
+docker\crw-patches\ fixes applied to fastCRW's source before the Docker build
 .github\            CI: scripts parse, C# compiles, compose file is valid
 bin\                fastCRW binaries and cdp-filter.exe (created by setup.ps1, not committed)
 LocalCrawler.exe    the tray app (built by tray\install.ps1, not committed)
 docker\.env         the Docker engine's SearXNG secret (created by crawl.ps1, not committed)
+build\crw-src\      fastCRW source with the patches applied (created by setup.ps1 -Docker, not committed)
 logs\, run\         logs and process state (not committed)
 .chrome-profile\    the crawler's private Chrome profile (not committed)
 ```
@@ -378,7 +394,7 @@ logs\, run\         logs and process state (not committed)
 
 1. Choose **Exit** in the tray, and answer **Yes** to stop the crawler. Or run `.\crawl.ps1 stop`.
 2. If you shared it over Tailscale, run `tailscale serve reset`.
-3. If you used the Docker engine, remove its images: `docker image rm local-crawl/crw:0.37.2-stealth ghcr.io/jo-inc/camofox-browser searxng/searxng:2026.5.9-0cba32c15`.
+3. If you used the Docker engine, remove its images: `docker image rm local-crawl/crw:0.37.2-fixes ghcr.io/jo-inc/camofox-browser searxng/searxng:2026.5.9-0cba32c15`.
 4. Delete the `Local Crawler` shortcuts from the Desktop and Start Menu, then delete this folder.
 
 ## Credits and license

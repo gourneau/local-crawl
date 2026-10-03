@@ -74,7 +74,7 @@ $BrowserModeFile = Join-Path $RunDir 'browser.mode'
 $EngineFile  = Join-Path $RunDir 'engine'
 $DockerDir   = Join-Path $Root 'docker'
 $ComposeFile = Join-Path $DockerDir 'compose.yml'
-$DockerImage = 'local-crawl/crw:0.37.2-stealth'
+$DockerImage = 'local-crawl/crw:0.37.2-fixes'
 
 $BrowserCandidates = @(
     $env:CRW_BROWSER,

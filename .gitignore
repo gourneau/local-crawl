@@ -1,5 +1,7 @@
 # Downloaded and built by setup.ps1
 bin/
+# fastCRW source with docker/crw-patches applied (setup.ps1 -Docker)
+build/
 
 # Optional pinned Chrome for Testing, unzipped by hand (see README)
 browser/

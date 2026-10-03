@@ -13,7 +13,7 @@
 .EXAMPLE
   .\setup.ps1
   .\setup.ps1 -Version 0.37.2
-  .\setup.ps1 -Docker     # also prepare the Docker engine (pulls images, builds crw; ~15 min first time)
+  .\setup.ps1 -Docker     # also prepare the Docker engine (pulls images, builds patched crw; ~15 min first time)
 #>
 param(
     [string]$Version = '0.37.2',
@@ -75,7 +75,29 @@ Write-Host "  built cdp-filter.exe"
 
 if ($Docker) {
     $compose = Join-Path $Root 'docker\compose.yml'
-    $ErrorActionPreference = 'Continue'   # docker writes progress to stderr
+    $ErrorActionPreference = 'Continue'   # docker and git write progress to stderr
+
+    # The crw image is fastCRW's source at this release plus the fixes in docker\crw-patches.
+    $src = Join-Path $Root 'build\crw-src'
+    Write-Host "Docker engine: preparing the fastCRW v$Version source..."
+    # core.autocrlf=false: keep fastCRW's LF line endings, so the patches apply and the
+    # Linux build sees the files exactly as upstream ships them.
+    if (-not (Test-Path (Join-Path $src '.git'))) {
+        & git -c core.autocrlf=false clone --quiet --depth 1 --branch "v$Version" https://github.com/fastcrw/crw.git $src
+        if ($LASTEXITCODE -ne 0) { throw "Cloning fastCRW v$Version failed. Is git installed?" }
+    } else {
+        & git -C $src config core.autocrlf false
+        & git -C $src fetch --quiet --depth 1 origin tag "v$Version"
+        & git -C $src checkout --quiet --force "v$Version"
+        if ($LASTEXITCODE -ne 0) { throw "Checking out fastCRW v$Version in $src failed." }
+        & git -C $src clean --quiet -fdx
+    }
+    foreach ($patch in Get-ChildItem (Join-Path $Root 'docker\crw-patches') -Filter '*.patch' | Sort-Object Name) {
+        & git -C $src apply --whitespace=nowarn $patch.FullName
+        if ($LASTEXITCODE -ne 0) { throw "Patch $($patch.Name) doesn't apply to fastCRW v$Version." }
+        Write-Host "  applied $($patch.Name)"
+    }
+
     Write-Host "Docker engine: pulling images..."
     & docker compose -f $compose pull --ignore-buildable
     if ($LASTEXITCODE -ne 0) { throw "Pulling Docker images failed. Is Docker Desktop running?" }

@@ -40,9 +40,16 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
   docker:
-    name: Compose file is valid
+    name: Compose file is valid, crw patches apply
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: docker compose config
         run: docker compose -f docker/compose.yml config --quiet
+      - name: crw patches apply to fastCRW v0.37.2
+        run: |
+          git clone --quiet --depth 1 --branch v0.37.2 https://github.com/fastcrw/crw.git "$RUNNER_TEMP/crw"
+          for p in docker/crw-patches/*.patch; do
+            git -C "$RUNNER_TEMP/crw" apply --check --whitespace=nowarn "$PWD/$p"
+            echo "ok  $p"
+          done
