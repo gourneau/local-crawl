@@ -1,0 +1,237 @@
+# local-crawl
+
+Run the [fastCRW](https://github.com/fastcrw/crw) web crawler natively on Windows, with no Docker and no WSL. You get:
+
+- A **system tray on/off switch**.
+- **JavaScript rendering** through your installed Chrome or Edge.
+- An **MCP server** your AI agents can use.
+- Optional sharing to your **other devices over Tailscale**.
+
+## Features
+
+- **Native and light.** fastCRW is a single Rust binary. On a test machine it idled at about 10–30 MB of RAM.
+- **Firecrawl-compatible API.** `/v1/scrape`, `/v1/crawl` and `/v1/map` return clean markdown, so Firecrawl SDKs work against it.
+- **MCP built in.** Claude Code, Cursor, VS Code and other MCP clients can scrape, crawl and map through it.
+- **JS pages just work.** Plain pages are fetched over HTTP. Single-page apps are rendered by a headless Chrome automatically.
+- **Tray app.** Green means running, gray means stopped. Start, stop, restart, view logs, and switch to a visible browser for debugging.
+- **Private by default.** Everything listens on `127.0.0.1` only. One Tailscale command shares it with your own devices, and nothing else.
+
+## How it works
+
+```mermaid
+flowchart LR
+    subgraph pc["Your Windows PC"]
+        tray["Tray app (LocalCrawler.exe)"] --> script["crawl.ps1"]
+        script -->|start / stop| crw["crw-server, 127.0.0.1:3002"]
+        script -->|start / stop| chrome["Chrome, private profile, 127.0.0.1:9223"]
+        crw -->|renders JS pages over DevTools| chrome
+        local["Local agents and scripts"] -->|"/mcp and /v1/*"| crw
+        serve["tailscale serve (optional)"] --> crw
+    end
+    remote["Your other devices on the tailnet"] --> serve
+```
+
+- `crawl.ps1` does all the work. The tray app is a small C# front end that calls it and polls the health endpoints.
+- Chrome runs with its own throwaway profile in `.chrome-profile\`, separate from your everyday browser. The scripts only ever stop the Chrome that uses that profile.
+
+## Requirements
+
+- Windows 10 or 11 (x64 or ARM64)
+- Google Chrome or Microsoft Edge, for JavaScript-heavy pages
+- Windows PowerShell 5.1 (built into Windows)
+- Optional: [Tailscale](https://tailscale.com), to use the crawler from other devices
+
+The tray app is compiled with the C# compiler that ships with Windows (.NET Framework 4.x). There is nothing extra to install.
+
+## Quick start
+
+```powershell
+git clone https://github.com/gourneau/local-crawl.git
+cd local-crawl
+.\setup.ps1           # downloads fastCRW and verifies its SHA-256 checksums
+.\tray\install.ps1    # builds the tray app and adds Desktop + Start Menu shortcuts
+```
+
+A globe icon appears in the system tray. Click it, then choose **Start crawler**. Test it:
+
+```powershell
+.\crawl.ps1 scrape https://example.com
+```
+
+If you don't want the tray app, skip `tray\install.ps1` and use `.\crawl.ps1 start` instead.
+
+## The tray app
+
+| Icon | Meaning |
+|---|---|
+| Green | Running |
+| Gray | Stopped |
+| Amber | Starting or stopping, or running with the browser closed (use **Restart**) |
+
+Left- or right-click the icon for the menu:
+
+- **Start / Stop crawler** and **Restart**
+- **Options → Hidden browser (headless)** or **Visible browser (for debugging)**. The tray remembers the choice.
+- **Show live log** opens a console window that follows the server log.
+- **Open logs folder**, **Open crawler folder**, **Copy API URL**
+- **Exit** asks whether to stop the crawler or leave it running in the background.
+
+Windows 11 hides new tray icons by default. Click `^` on the taskbar to find it, or turn it on under **Settings → Personalization → Taskbar → Other system tray icons**.
+
+The source is in `tray\`. After editing it, run `.\tray\install.ps1` again. Use `-BuildOnly` to skip the shortcuts.
+
+## Command line
+
+```powershell
+.\crawl.ps1 start            # start Chrome + crw-server, wait until healthy
+.\crawl.ps1 start -Headed    # same, with a visible browser window
+.\crawl.ps1 status           # running? healthy? memory? browser mode?
+.\crawl.ps1 stop
+.\crawl.ps1 restart          # add -Headed to restart into visible mode
+.\crawl.ps1 logs             # follow logs\crw-server.log
+.\crawl.ps1 scrape <url>     # print one page as markdown
+```
+
+`start.cmd` and `stop.cmd` do the same as `start` and `stop` when double-clicked. Nothing starts at login unless you set that up yourself.
+
+## Using the REST API
+
+The base URL is `http://127.0.0.1:3002`. No API key is needed locally.
+
+```powershell
+# One page to markdown (Windows PowerShell 5.1 quoting; in PowerShell 7 drop the backslashes)
+curl.exe -s http://127.0.0.1:3002/v1/scrape -H "Content-Type: application/json" -d '{\"url\":\"https://example.com\"}'
+```
+
+| Endpoint | Body example | What it does |
+|---|---|---|
+| `POST /v1/scrape` | `{"url":"https://example.com"}` | One page as markdown, HTML, links, or a screenshot |
+| `POST /v1/scrape` | `{"url":"...","renderJs":true}` | Force Chrome rendering for a single-page app |
+| `POST /v1/map` | `{"url":"https://example.com","limit":50}` | Discover a site's URLs |
+| `POST /v1/crawl` | `{"url":"...","limit":20,"maxDepth":2}` | Start an async crawl and return a job id |
+| `GET /v1/crawl/<id>` | | Poll a crawl job for status and pages |
+| `GET /v1/capabilities` | | What this server supports |
+
+See the [fastCRW API docs](https://docs.fastcrw.com/) for the full set of options.
+
+## Connecting AI agents (MCP)
+
+The MCP endpoint is `http://127.0.0.1:3002/mcp`, using the streamable HTTP transport.
+
+**Claude Code on the same PC:**
+
+```powershell
+claude mcp add --scope user --transport http crw http://127.0.0.1:3002/mcp
+```
+
+Agents get these tools: `crw_scrape`, `crw_crawl`, `crw_check_crawl_status`, `crw_map`, `crw_extract`, `crw_check_extract_status`, `crw_cancel_extract` and `crw_parse_file`.
+
+If a client only supports stdio MCP, run `bin\crw-mcp.exe --api-url http://127.0.0.1:3002 --hide-credits` as the command.
+
+## Sharing with your other devices (Tailscale)
+
+[Tailscale Serve](https://tailscale.com/kb/1312/serve) forwards traffic from your tailnet to the crawler. crw-server still only listens on `127.0.0.1`, so it isn't exposed to your LAN or the internet, and no firewall changes are needed.
+
+**1. On the Windows PC, run this once.** It stays on across reboots:
+
+```powershell
+& "C:\Program Files\Tailscale\tailscale.exe" serve --bg --http=3002 3002
+```
+
+**2. Find the PC's tailnet name.** It's shown by `tailscale status` and in the Tailscale admin console. The full name looks like `your-pc.your-tailnet.ts.net`. Replace `your-pc.your-tailnet.ts.net` below with yours.
+
+**3. Point your other devices at it.**
+
+Quick test from another device. It should print `200`:
+
+```sh
+curl -s -o /dev/null -w "%{http_code}\n" http://your-pc.your-tailnet.ts.net:3002/health
+```
+
+| Client | Setup |
+|---|---|
+| **Claude Code** | `claude mcp add --scope user --transport http crw http://your-pc.your-tailnet.ts.net:3002/mcp` |
+| **Cursor** (`~/.cursor/mcp.json`) | `{"mcpServers": {"crw": {"url": "http://your-pc.your-tailnet.ts.net:3002/mcp"}}}` |
+| **VS Code** (`.vscode/mcp.json`) | `{"servers": {"crw": {"type": "http", "url": "http://your-pc.your-tailnet.ts.net:3002/mcp"}}}` |
+| **Firecrawl SDKs / scripts** | Base URL `http://your-pc.your-tailnet.ts.net:3002` |
+
+**Claude Desktop** custom connectors connect from Anthropic's cloud, which can't reach a tailnet. Use the [`mcp-remote`](https://github.com/geelen/mcp-remote) bridge instead, which needs Node.js. Add this to `claude_desktop_config.json`. On macOS, that file is in `~/Library/Application Support/Claude/`.
+
+```json
+{
+  "mcpServers": {
+    "crw": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "http://your-pc.your-tailnet.ts.net:3002/mcp", "--allow-http"]
+    }
+  }
+}
+```
+
+Then fully quit and reopen Claude Desktop. If it can't find `npx`, use the full path that `which npx` prints.
+
+Good to know:
+
+- **Plain `http` is fine here.** Tailscale encrypts the traffic between devices. If a client insists on `https`, turn on HTTPS certificates in the Tailscale admin console and serve with `--https=443` instead.
+- **The crawler must be running** (tray icon green). Otherwise remote clients get errors.
+- **There's no API key**, so every device on your tailnet can use it. If you share your tailnet, add `[auth] api_keys` in `config.local.toml`.
+- **Phone and web apps won't work:** Claude's mobile and web connectors connect from the cloud, so they can't reach a tailnet address.
+- **To stop sharing:** `& "C:\Program Files\Tailscale\tailscale.exe" serve reset`
+
+## Debugging with a visible browser
+
+Choose **Options → Visible browser (for debugging)** in the tray, or run `.\crawl.ps1 restart -Headed`. Chrome opens a window, and pages crw renders appear as tabs, so you can watch what a site does.
+
+If you close that window, Chrome exits. JS pages then stop rendering until you click **Restart**. Plain HTML pages still work. The tray turns amber when this happens.
+
+## Configuration
+
+| What | Where |
+|---|---|
+| API and browser ports (default `3002`, `9223`) | Top of `crawl.ps1`. The tray app reads them from there. |
+| robots.txt, request rate, concurrency, render timeouts | `config.local.toml` |
+| Which browser to use | `$env:CRW_BROWSER`, else Chrome for Testing in `browser\chrome-win64\`, else installed Chrome, else Edge |
+| fastCRW version | `.\setup.ps1 -Version x.y.z` (stop the crawler first) |
+
+The defaults are polite: robots.txt is respected, with 3 requests per second and 5 concurrent requests. The full option list is in the [fastCRW configuration docs](https://docs.fastcrw.com/configuration/).
+
+**Optional: a browser that never updates itself.** Your installed Chrome updates itself and may show update prompts in visible mode. To pin a version instead, download `chrome-win64.zip` from [Chrome for Testing](https://googlechromelabs.github.io/chrome-for-testing/) and unzip it so that `browser\chrome-win64\chrome.exe` exists. The scripts use it automatically.
+
+## Troubleshooting
+
+| Symptom | Cause / fix |
+|---|---|
+| Pages are slow, or fall back to Chrome often | crw's direct HTTP fetch has a hardcoded 2.5 s connect timeout, so a weak Wi-Fi link misses it. Pages still come back via Chrome, just slower. A better connection fixes it. |
+| Garbled characters (`Ã©`, `â€™`) in PowerShell | Windows PowerShell 5.1's `Invoke-RestMethod` decodes this API as Latin-1. Use `curl.exe`, PowerShell 7, or `.\crawl.ps1 scrape`. |
+| "Port 3002 is already used by …" | Another app has the port. Change `$ApiPort` at the top of `crawl.ps1`. |
+| Tray icon is amber while running | The browser was closed. Click **Restart**. |
+| `/v1/search` returns 503 | Search needs a [SearXNG](https://docs.fastcrw.com/) backend, which isn't set up here. |
+| `json` / `summary` formats or `/v1/extract` fail | They need an LLM API key in `[extraction.llm]`. |
+
+The logs are in `logs\`: `crw-server.log`, plus `browser.log` for Chrome.
+
+## Project layout
+
+```
+crawl.ps1           start / stop / status / logs / scrape
+setup.ps1           downloads + verifies the fastCRW binaries into bin\
+config.local.toml   crawler settings (crw loads it from this folder)
+start.cmd, stop.cmd double-click wrappers
+tray\               tray app source (C#) and install.ps1
+bin\                fastCRW binaries (created by setup.ps1, not committed)
+logs\, run\         logs and process state (not committed)
+.chrome-profile\    the crawler's private Chrome profile (not committed)
+```
+
+## Uninstall
+
+1. Choose **Exit** in the tray, and answer **Yes** to stop the crawler. Or run `.\crawl.ps1 stop`.
+2. If you shared it over Tailscale, run `tailscale serve reset`.
+3. Delete the `Local Crawler` shortcuts from the Desktop and Start Menu, then delete this folder.
+
+## Credits and license
+
+- [fastCRW](https://github.com/fastcrw/crw) does the actual crawling. It is licensed AGPL-3.0. This repo doesn't include its binaries; `setup.ps1` downloads them from fastCRW's official GitHub releases and checks them against the published SHA-256 checksums.
+- The scripts and tray app in this repo are MIT licensed; see [LICENSE](LICENSE).
+
+Please crawl responsibly. Respect robots.txt and site terms, and keep request rates modest. Heavy crawling from a home IP can get that IP rate-limited or blocked.

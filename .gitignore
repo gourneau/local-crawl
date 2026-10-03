@@ -1,0 +1,12 @@
+# Downloaded by setup.ps1
+bin/
+browser/
+
+# Runtime state
+logs/
+run/
+.chrome-profile/
+
+# Built by tray/install.ps1
+LocalCrawler.exe
+tray/crawler.ico

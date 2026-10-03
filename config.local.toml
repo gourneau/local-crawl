@@ -1,0 +1,22 @@
+# Local overrides for crw-server. crw loads this file from its working directory.
+# Host, port, and the Chrome DevTools URL are set by crawl.ps1 (env vars win over this file).
+# Full reference: https://docs.fastcrw.com/configuration/
+
+[renderer]
+# HTTP first; switch to headless Chrome only when a page looks like a JS app.
+# Force it per request with "renderJs": true.
+mode = "auto"
+# Generous budget for a slow or jittery home connection (default 30000).
+page_timeout_ms = 45000
+pool_size = 4
+
+[mcp]
+# Drop cloud-billing fields (creditCost/creditsUsed) from MCP tool results; they are
+# meaningless when self-hosted and only cost agents tokens.
+hide_credits = true
+
+[crawler]
+respect_robots_txt = true
+# Be polite: we crawl from a home IP, so keep the request rate modest.
+max_concurrency = 5
+requests_per_second = 3.0
