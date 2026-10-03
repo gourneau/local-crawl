@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  windows:
+    name: Scripts parse, C# builds
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: PowerShell scripts parse
+        shell: powershell
+        run: |
+          $failed = $false
+          foreach ($file in git ls-files '*.ps1') {
+            $errors = $null
+            $null = [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $file).Path, [ref]$null, [ref]$errors)
+            foreach ($e in $errors) {
+              $failed = $true
+              Write-Output "::error file=$file,line=$($e.Extent.StartLineNumber)::$($e.Message)"
+            }
+            if (-not $errors) { Write-Output "ok  $file" }
+          }
+          if ($failed) { exit 1 }
+
+      - name: Build the tray app and the DevTools filter
+        shell: powershell
+        run: |
+          # The same compiler install.ps1 and setup.ps1 use: the one that ships with Windows.
+          $csc = "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+          & $csc /nologo /target:winexe /out:LocalCrawler.exe `
+            /reference:System.Windows.Forms.dll /reference:System.Drawing.dll `
+            tray\LocalCrawlerTray.cs tray\GlobeArt.cs
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          & $csc /nologo /target:winexe /out:cdp-filter.exe `
+            /reference:System.Web.Extensions.dll filter\CdpFilter.cs
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+  docker:
+    name: Compose file is valid
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: docker compose config
+        run: docker compose -f docker/compose.yml --profile extras config --quiet

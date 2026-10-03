@@ -1,5 +1,7 @@
 # local-crawl
 
+[![CI](https://github.com/gourneau/local-crawl/actions/workflows/ci.yml/badge.svg)](https://github.com/gourneau/local-crawl/actions/workflows/ci.yml)
+
 Run the [fastCRW](https://github.com/fastcrw/crw) web crawler natively on Windows, with no Docker and no WSL. You get:
 
 - A **system tray on/off switch**.
