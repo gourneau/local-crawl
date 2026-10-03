@@ -229,7 +229,7 @@ Let Claude keep its built-in web search for finding pages. The Docker engine add
 **Minimal version.** One line is enough:
 
 ```markdown
-To read web pages, use the crw MCP tools (`crw_scrape`; `crw_map`/`crw_crawl` for many pages) instead of the built-in web fetch. crw gets through sites that block the built-in fetcher. Keep using built-in web search to find pages.
+To read web pages, use the crw MCP tools (`crw_scrape`; `crw_map`/`crw_crawl` for many pages) instead of the built-in web fetch. crw gets through sites that block the built-in fetcher. Use built-in web search to find pages; don't use `crw_search`.
 ```
 
 **Fuller version,** with usage tips:
