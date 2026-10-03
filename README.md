@@ -155,7 +155,7 @@ curl -s -o /dev/null -w "%{http_code}\n" http://your-pc.your-tailnet.ts.net:3002
 | **VS Code** (`.vscode/mcp.json`) | `{"servers": {"crw": {"type": "http", "url": "http://your-pc.your-tailnet.ts.net:3002/mcp"}}}` |
 | **Firecrawl SDKs / scripts** | Base URL `http://your-pc.your-tailnet.ts.net:3002` |
 
-**Claude Desktop** custom connectors connect from Anthropic's cloud, which can't reach a tailnet. Use the [`mcp-remote`](https://github.com/geelen/mcp-remote) bridge instead, which needs Node.js. Add this to `claude_desktop_config.json`. On macOS, that file is in `~/Library/Application Support/Claude/`.
+**Claude Desktop** custom connectors connect from Anthropic's cloud, which can't reach a tailnet. Use the [`mcp-remote`](https://github.com/punkpeye/mcp-remote) bridge instead, which needs Node.js. Add this to `claude_desktop_config.json`. On macOS, that file is in `~/Library/Application Support/Claude/`.
 
 ```json
 {
@@ -193,7 +193,9 @@ If you close that window, Chrome exits. JS pages then stop rendering until you c
 | Which browser to use | `$env:CRW_BROWSER`, else Chrome for Testing in `browser\chrome-win64\`, else installed Chrome, else Edge |
 | fastCRW version | `.\setup.ps1 -Version x.y.z` (stop the crawler first) |
 
-The defaults are polite: robots.txt is respected, with 3 requests per second and 5 concurrent requests. The full option list is in the [fastCRW configuration docs](https://docs.fastcrw.com/configuration/).
+The defaults are polite: robots.txt is respected, with 3 requests per second and 5 concurrent requests.
+
+crw's limit on *incoming* API requests is turned off (`rate_limit_rps = 0`). Its default of 10 per second is shared by all clients. MCP apps like Claude Desktop open several connections at once on startup, and some were refused with HTTP 429. This doesn't change how fast sites are crawled. The full option list is in the [fastCRW configuration docs](https://docs.fastcrw.com/configuration/).
 
 **Optional: a browser that never updates itself.** Your installed Chrome updates itself and may show update prompts in visible mode. To pin a version instead, download `chrome-win64.zip` from [Chrome for Testing](https://googlechromelabs.github.io/chrome-for-testing/) and unzip it so that `browser\chrome-win64\chrome.exe` exists. The scripts use it automatically.
 

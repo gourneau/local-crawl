@@ -2,6 +2,12 @@
 # Host, port, and the Chrome DevTools URL are set by crawl.ps1 (env vars win over this file).
 # Full reference: https://docs.fastcrw.com/configuration/
 
+[server]
+# crw's limit on incoming API requests, shared by all clients (default 10/s). MCP clients
+# open several connections at once on startup and were getting HTTP 429, so turn it off.
+# 0 = unlimited. This does not change how fast sites are crawled: see [crawler] below.
+rate_limit_rps = 0
+
 [renderer]
 # HTTP first; switch to headless Chrome only when a page looks like a JS app.
 # Force it per request with "renderJs": true.

@@ -88,7 +88,10 @@ function Wait-Url([string]$Url, [int]$Seconds) {
 }
 
 function Assert-PortFree([int]$Port, [string]$What) {
+    # Only listeners on loopback or all interfaces clash with our 127.0.0.1 bind. Others are
+    # fine, e.g. `tailscale serve` forwarding the same port on the Tailscale address.
     $owner = Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue |
+        Where-Object { $_.LocalAddress -in '127.0.0.1', '0.0.0.0', '::' } |
         Select-Object -First 1
     if ($owner) {
         $procName = (Get-Process -Id $owner.OwningProcess -ErrorAction SilentlyContinue).ProcessName
