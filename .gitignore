@@ -2,6 +2,9 @@
 bin/
 browser/
 
+# Docker engine secrets (created by crawl.ps1)
+docker/.env
+
 # Runtime state
 logs/
 run/

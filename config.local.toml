@@ -26,7 +26,8 @@ pool_size = 4
 hide_credits = true
 
 [crawler]
-respect_robots_txt = true
+# Ignore robots.txt (it otherwise limits crawl and map). The rate limits below still apply.
+respect_robots_txt = false
 # Be polite: we crawl from a home IP, so keep the request rate modest.
 max_concurrency = 5
 requests_per_second = 3.0

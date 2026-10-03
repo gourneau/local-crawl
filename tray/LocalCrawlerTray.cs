@@ -45,7 +45,9 @@ class TrayContext : ApplicationContext
     readonly string _apiUrl;
     readonly string _cdpUrl;
     readonly string _modeFile;        // written by crawl.ps1: mode of the running browser
-    readonly string _preferenceFile;  // the tray's saved choice for the next start
+    readonly string _engineFile;      // written by crawl.ps1: the running engine
+    readonly string _preferenceFile;  // the tray's saved browser mode for the next start
+    readonly string _enginePreferenceFile;  // the tray's saved engine for the next start
     readonly NotifyIcon _icon;
     readonly Control _ui;             // hidden control, used to get back onto the UI thread
     readonly System.Windows.Forms.Timer _poll;
@@ -56,6 +58,8 @@ class TrayContext : ApplicationContext
     readonly ToolStripMenuItem _hiddenItem;
     readonly ToolStripMenuItem _visibleItem;
     readonly ToolStripMenuItem _headlessItem;
+    readonly ToolStripMenuItem _localEngineItem;
+    readonly ToolStripMenuItem _dockerEngineItem;
     readonly Icon _runningIcon = MakeIcon(Color.FromArgb(46, 160, 67));
     readonly Icon _stoppedIcon = MakeIcon(Color.FromArgb(130, 139, 150));
     readonly Icon _attentionIcon = MakeIcon(Color.FromArgb(212, 160, 23));
@@ -66,15 +70,20 @@ class TrayContext : ApplicationContext
     string _preferredMode;  // browser mode for the next start: "hidden", "visible" or "headless"
     bool _browserUp;
     string _runningMode;    // mode of the running browser, or null when unknown
+    string _preferredEngine;  // engine for the next start: "local" or "docker"
+    string _runningEngine;    // the running engine, or null when unknown
 
     public TrayContext()
     {
         _apiUrl = "http://127.0.0.1:" + ReadSetting("ApiPort", "3002");
         _cdpUrl = "http://127.0.0.1:" + ReadSetting("CdpPort", "9223");
         _modeFile = Path.Combine(_root, @"run\browser.mode");
+        _engineFile = Path.Combine(_root, @"run\engine");
         _preferenceFile = Path.Combine(_root, @"run\tray-browser-mode");
+        _enginePreferenceFile = Path.Combine(_root, @"run\tray-engine");
         _preferredMode = ReadFile(_preferenceFile);
         if (_preferredMode != "visible" && _preferredMode != "headless") _preferredMode = "hidden";
+        _preferredEngine = ReadFile(_enginePreferenceFile) == "docker" ? "docker" : "local";
 
         _ui = new Control();
         IntPtr forceHandle = _ui.Handle;
@@ -89,7 +98,12 @@ class TrayContext : ApplicationContext
         _hiddenItem = new ToolStripMenuItem("Hidden window (most realistic)", null, delegate { SetBrowserMode("hidden"); });
         _visibleItem = new ToolStripMenuItem("Visible window (for debugging)", null, delegate { SetBrowserMode("visible"); });
         _headlessItem = new ToolStripMenuItem("Headless (lightest, easiest to detect)", null, delegate { SetBrowserMode("headless"); });
+        _localEngineItem = new ToolStripMenuItem("Local engine (no Docker needed)", null, delegate { SetEngine("local"); });
+        _dockerEngineItem = new ToolStripMenuItem("Docker engine (adds Chrome-grade HTTP, Camoufox, search)", null, delegate { SetEngine("docker"); });
         _optionsItem = new ToolStripMenuItem("Options");
+        _optionsItem.DropDownItems.Add(_localEngineItem);
+        _optionsItem.DropDownItems.Add(_dockerEngineItem);
+        _optionsItem.DropDownItems.Add(new ToolStripSeparator());
         _optionsItem.DropDownItems.Add(_hiddenItem);
         _optionsItem.DropDownItems.Add(_visibleItem);
         _optionsItem.DropDownItems.Add(_headlessItem);
@@ -139,6 +153,8 @@ class TrayContext : ApplicationContext
         ThreadPool.QueueUserWorkItem(delegate
         {
             bool apiUp = IsUp(_apiUrl + "/health");
+            string engine = ReadFile(_engineFile);
+            // Both engines render with the PC's own Chrome, which can be closed by hand.
             bool browserUp = apiUp && IsUp(_cdpUrl + "/json/version");
             string mode = ReadFile(_modeFile);
             _ui.BeginInvoke((Action)delegate
@@ -147,6 +163,7 @@ class TrayContext : ApplicationContext
                 if (_busy) return;
                 _browserUp = browserUp;
                 _runningMode = mode;
+                _runningEngine = engine;
                 UpdateUi(apiUp ? CrawlerState.Running : CrawlerState.Stopped, null);
             });
         });
@@ -177,8 +194,9 @@ class TrayContext : ApplicationContext
         if (state == CrawlerState.Running && _browserUp)
         {
             _icon.Icon = _runningIcon;
-            SetTooltip("running" + (_runningMode != null ? " (" + _runningMode + ")" : ""));
-            _statusItem.Text = "Running at " + _apiUrl;
+            string detail = (_runningEngine == "docker" ? "docker, " : "local, ") + (_runningMode ?? "browser");
+            SetTooltip("running (" + detail + ")");
+            _statusItem.Text = "Running at " + _apiUrl + " (" + detail + ")";
             _toggleItem.Text = "Stop crawler";
         }
         else if (state == CrawlerState.Running)
@@ -208,8 +226,13 @@ class TrayContext : ApplicationContext
         _restartItem.Enabled = state == CrawlerState.Running;
         _optionsItem.Enabled = settled;
 
-        // While running, show the mode actually in use; otherwise the one the next start will use.
-        string mode = (state == CrawlerState.Running && _runningMode != null) ? _runningMode : _preferredMode;
+        // While running, show what's actually in use; otherwise what the next start will use.
+        bool running = state == CrawlerState.Running;
+        string engine = (running && _runningEngine != null) ? _runningEngine : _preferredEngine;
+        _localEngineItem.Checked = engine != "docker";
+        _dockerEngineItem.Checked = engine == "docker";
+
+        string mode = (running && _runningMode != null) ? _runningMode : _preferredMode;
         _hiddenItem.Checked = mode == "hidden";
         _visibleItem.Checked = mode == "visible";
         _headlessItem.Checked = mode == "headless";
@@ -256,11 +279,33 @@ class TrayContext : ApplicationContext
         }
     }
 
+    void SetEngine(string engine)
+    {
+        _preferredEngine = engine;
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(_enginePreferenceFile));
+            File.WriteAllText(_enginePreferenceFile, engine);
+        }
+        catch
+        {
+        }
+
+        if (_state == CrawlerState.Running && (_runningEngine ?? "local") != engine)
+        {
+            RunAction("restart", "Switching to the " + engine + " engine...", "Now running the " + engine + " engine.");
+        }
+        else
+        {
+            UpdateUi(_state, null);
+        }
+    }
+
     void RunAction(string command, string busyText, string doneText)
     {
         if (_busy) return;
         _busy = true;
-        if (command != "stop") command += " -Browser " + _preferredMode;
+        if (command != "stop") command += " -Engine " + _preferredEngine + " -Browser " + _preferredMode;
         UpdateUi(CrawlerState.Busy, busyText);
         ThreadPool.QueueUserWorkItem(delegate
         {
@@ -295,7 +340,8 @@ class TrayContext : ApplicationContext
         {
             using (Process p = Process.Start(psi))
             {
-                if (!p.WaitForExit(180000)) return "Timed out waiting for crawl.ps1 " + command + ".";
+                // Generous: starting the Docker engine can include starting Docker Desktop.
+                if (!p.WaitForExit(420000)) return "Timed out waiting for crawl.ps1 " + command + ".";
                 if (p.ExitCode == 0) return null;
             }
             string saved = ReadFile(errorFile);

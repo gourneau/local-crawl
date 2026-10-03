@@ -10,9 +10,13 @@
 .EXAMPLE
   .\setup.ps1
   .\setup.ps1 -Version 0.37.2
+  .\setup.ps1 -Docker     # also prepare the Docker engine (pulls images, builds crw; ~15 min first time)
 #>
 param(
-    [string]$Version = '0.37.2'
+    [string]$Version = '0.37.2',
+
+    # Also pull the Docker engine's images and build its crw image (with Camoufox).
+    [switch]$Docker
 )
 
 $ErrorActionPreference = 'Stop'
@@ -65,6 +69,19 @@ $csc = "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
     /reference:System.Web.Extensions.dll (Join-Path $Root 'filter\CdpFilter.cs')
 if ($LASTEXITCODE -ne 0) { throw "Building the DevTools filter failed (csc exit code $LASTEXITCODE)." }
 Write-Host "  built cdp-filter.exe"
+
+if ($Docker) {
+    $compose = Join-Path $Root 'docker\compose.yml'
+    $ErrorActionPreference = 'Continue'   # docker writes progress to stderr
+    Write-Host "Docker engine: pulling images..."
+    & docker compose -f $compose pull --ignore-buildable
+    if ($LASTEXITCODE -ne 0) { throw "Pulling Docker images failed. Is Docker Desktop running?" }
+    Write-Host "Docker engine: building crw with the Camoufox tier (the first build takes a while)..."
+    & docker compose -f $compose build crw
+    if ($LASTEXITCODE -ne 0) { throw "Building the crw Docker image failed." }
+    $ErrorActionPreference = 'Stop'
+    Write-Host "  Docker engine ready. Start it with: .\crawl.ps1 start -Engine docker"
+}
 
 Write-Host ""
 Write-Host "Done. Next: .\crawl.ps1 start   (or build the tray app: .\tray\install.ps1)"

@@ -34,6 +34,9 @@ static class CdpFilter
     static readonly object LogLock = new object();
     static readonly Dictionary<string, int> MethodCounts = new Dictionary<string, int>();
     static readonly Regex MethodPattern = new Regex("\"method\"\\s*:\\s*\"([^\"]+)\"");
+    static readonly Regex HostHeader = new Regex("(?im)^Host:[ \\t]*([^\\r\\n]*)\\r\\n");
+    static readonly Regex ConnectionHeader = new Regex("(?im)^Connection:[^\\r\\n]*\\r\\n");
+    static readonly Regex ContentLengthHeader = new Regex("(?im)^Content-Length:[^\\r\\n]*\\r\\n");
 
     static int Main(string[] args)
     {
@@ -75,18 +78,54 @@ static class CdpFilter
             byte[] head, extra;
             if (!ReadHttpHead(clientStream, out head, out extra)) return;
 
+            // Chrome only answers DevTools requests whose Host is an IP or "localhost", so present
+            // ourselves as a local client. That lets crw reach us under another name, e.g.
+            // host.docker.internal from a Docker container.
+            string headText = Encoding.ASCII.GetString(head);
+            Match hostMatch = HostHeader.Match(headText);
+            string clientHost = hostMatch.Success ? hostMatch.Groups[1].Value.Trim() : "127.0.0.1:" + _listenPort;
+            string upstreamHost = "127.0.0.1:" + _upstreamPort;
+            bool isWebSocket = headText.IndexOf("upgrade: websocket", StringComparison.OrdinalIgnoreCase) >= 0;
+            headText = HostHeader.Replace(headText, "Host: " + upstreamHost + "\r\n", 1);
+            head = Encoding.ASCII.GetBytes(headText);
+
             upstream.Connect(IPAddress.Loopback, _upstreamPort);
             NetworkStream upstreamStream = upstream.GetStream();
             upstreamStream.Write(head, 0, head.Length);
             if (extra.Length > 0) upstreamStream.Write(extra, 0, extra.Length);
 
-            if (Encoding.ASCII.GetString(head).IndexOf("upgrade: websocket", StringComparison.OrdinalIgnoreCase) < 0)
+            if (!isWebSocket)
             {
-                // Plain HTTP (/json/version and friends): copy both ways until either side closes.
-                Thread toUpstream = new Thread(delegate () { Copy(clientStream, upstreamStream); });
-                toUpstream.IsBackground = true;
-                toUpstream.Start();
-                Copy(upstreamStream, clientStream);
+                // Plain HTTP (/json/version and friends): one request per connection. Point the
+                // DevTools URLs in the reply back at us, under the name the client used.
+                byte[] replyHead, replyStart;
+                if (!ReadHttpHead(upstreamStream, out replyHead, out replyStart)) return;
+                string replyHeadText = Encoding.ASCII.GetString(replyHead);
+                Match length = ContentLengthHeader.Match(replyHeadText);
+                byte[] body = replyStart;
+                if (length.Success)
+                {
+                    int bodyLength = int.Parse(length.Value.Substring(length.Value.IndexOf(':') + 1).Trim(), CultureInfo.InvariantCulture);
+                    body = new byte[bodyLength];
+                    int have = Math.Min(replyStart.Length, bodyLength);
+                    Buffer.BlockCopy(replyStart, 0, body, 0, have);
+                    while (have < bodyLength)
+                    {
+                        int n = upstreamStream.Read(body, have, bodyLength - have);
+                        if (n <= 0) break;
+                        have += n;
+                    }
+                }
+                string bodyText = Encoding.UTF8.GetString(body)
+                    .Replace("ws://" + upstreamHost + "/", "ws://" + clientHost + "/")
+                    .Replace("ws=" + upstreamHost + "/", "ws=" + clientHost + "/");
+                byte[] bodyBytes = Encoding.UTF8.GetBytes(bodyText);
+                replyHeadText = ConnectionHeader.Replace(ContentLengthHeader.Replace(replyHeadText, ""), "");
+                replyHeadText = replyHeadText.Substring(0, replyHeadText.Length - 2) +
+                    "Content-Length: " + bodyBytes.Length + "\r\nConnection: close\r\n\r\n";
+                byte[] headBytes = Encoding.ASCII.GetBytes(replyHeadText);
+                clientStream.Write(headBytes, 0, headBytes.Length);
+                clientStream.Write(bodyBytes, 0, bodyBytes.Length);
                 return;
             }
 

@@ -1,0 +1,68 @@
+# crw settings for the Docker engine (crawl.ps1 -Engine docker). Based on fastCRW's
+# config.docker.toml and config.stealth.toml, with every stealth tier switched on.
+# Full reference: https://docs.fastcrw.com/configuration/
+
+[server]
+# No limit on incoming API requests (MCP clients open several sessions at once).
+rate_limit_rps = 0
+
+[request]
+deadline_ms_default = 15000
+auto_extend_deadline_for_ladder = true
+
+[renderer]
+mode = "auto"
+page_timeout_ms = 45000
+http_timeout_ms = 4000
+lightpanda_timeout_ms = 2500
+chrome_timeout_ms = 30000
+chrome_nav_budget_ms = 12000
+# Load images and fonts like a real visit (fastCRW's stealth config blocks them for speed).
+chrome_intercept_resources = false
+# Give bot challenges a few chances to clear in the browser.
+chrome_challenge_max_retries = 3
+# The Chrome tier is the host's real Chrome via the DevTools filter (URL set in compose.yml).
+# No context pool: pages use the browser's own profile, cookies included, like a real visit.
+chrome_backend = "vanilla"
+chrome_context_pool_enabled = false
+
+[renderer.lightpanda]
+# Off: send JS pages straight to the real Chrome (LightPanda failed basic fingerprint checks).
+ws_url = ""
+
+[renderer.camoufox]
+base_url = "http://camoufox:9377"
+# Join the automatic fallback chain as the last tier.
+include_in_auto = true
+
+[search]
+searxng_url = "http://searxng:8080"
+query_expand = true
+query_expand_variants = 3
+
+[map.url_filter]
+strip_tracking_params = true
+drop_action_urls = true
+gov_tld_drop_actions = false
+
+[document]
+enabled = true
+max_pages = 0
+attempt_scanned = false
+max_upload_bytes = 52428800
+upload_concurrency = 2
+max_concurrent_parses = 2
+parse_timeout_ms = 30000
+max_decompressed_bytes = 104857600
+sandbox = true
+sandbox_memory_bytes = 536870912
+
+[mcp]
+hide_credits = true
+
+[crawler]
+# Ignore robots.txt (it otherwise limits crawl and map). The rate limits below still apply.
+respect_robots_txt = false
+# Be polite: we crawl from a home IP.
+max_concurrency = 5
+requests_per_second = 3.0

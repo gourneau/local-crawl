@@ -14,7 +14,8 @@ Run the [fastCRW](https://github.com/fastcrw/crw) web crawler natively on Window
 - **MCP built in.** Claude Code, Cursor, VS Code and other MCP clients can scrape, crawl and map through it.
 - **JS pages just work.** Plain pages are fetched over HTTP. Single-page apps are rendered in Chrome automatically.
 - **Looks like a real browser.** Chrome runs as a real window parked off-screen, not headless. A small filter strips crw's automation giveaways, so websites see a genuine Chrome on Windows. See [How it looks to websites](#how-it-looks-to-websites).
-- **Tray app.** Green means running, gray means stopped. Start, stop, restart, view logs, and switch to a visible browser for debugging.
+- **Optional Docker engine.** Adds web search (SearXNG), a Chrome-grade HTTP fallback (`impersonated-http`) and Camoufox, on top of the same real Chrome. See [Engines](#engines-local-or-docker).
+- **Tray app.** Green means running, gray means stopped. Start, stop, restart, view logs, switch engines, and switch to a visible browser for debugging.
 - **Private by default.** Everything listens on `127.0.0.1` only. One Tailscale command shares it with your own devices, and nothing else.
 
 ## How it works
@@ -65,12 +66,45 @@ Measured with the crawler itself, on Chrome 154 on Windows:
 | `navigator.webdriver` | true (detected) | false |
 | WebGL | fake Intel Iris (detected) | real GPU |
 
+## Engines: local or Docker
+
+There are two ways to run it. Switch in the tray (**Options → Local engine / Docker engine**) or with `.\crawl.ps1 restart -Engine docker`. Both serve the same API on the same port, so MCP clients and Tailscale don't notice the switch.
+
+| | Local engine | Docker engine (hybrid) |
+|---|---|---|
+| Needs | Windows only | Docker Desktop, plus `.\setup.ps1 -Docker` once |
+| Plain HTTP fetch | crw's own TLS (not Chrome-like) | same, **plus** a fallback with real Chrome's TLS and HTTP/2 fingerprint (`impersonated-http`) when a site walls the plain fetch |
+| JavaScript pages | your real Chrome, through the filter | the same real Chrome, through the same filter |
+| Last resort | none | **Camoufox**, an anti-detect Firefox |
+| Web search (`/v1/search`, `crw_search`) | no | **yes** (SearXNG) |
+| Extra memory | none | about 1–2 GB for the containers |
+
+The Docker engine is fastCRW's [self-hosting stack](https://docs.fastcrw.com/self-hosting/), rebuilt with the Camoufox tier compiled in. Its Chrome tier points at your PC's real Chrome instead of fastCRW's browsers, because that measured far better:
+
+| Chrome tier (same tests as above) | sannysoft | CreepJS headless / stealth | stealthcheck | rebrowser leaks |
+|---|---|---|---|---|
+| **Your real Chrome + filter** (both engines) | **31 / 31** | **0% / 0%** | **92** | none |
+| fastCRW's browserless "stealth" Chrome | 28 / 31 | 67% / 80% | 25 | 3 detected |
+| fastCRW's LightPanda | 25 / 30 | (falls back) | (falls back) | (falls back) |
+| Camoufox (Docker engine's last tier) | 9 / 10 | 0% / 0% | n/a (Firefox) | none |
+
+Network fingerprint ([tls.peet.ws](https://tls.peet.ws/api/all)):
+
+| Fetch | JA4 | HTTP/2 fingerprint | Looks like Chrome? |
+|---|---|---|---|
+| crw plain HTTP (both engines) | `t13d1011h2_61a7ad8aa9b6_…` | `9b5dcd07…` | no |
+| `impersonated-http` (Docker engine) | `t13d1516h2_8daaf6152771_…` | `52d84b11…` | **yes** |
+| Chrome (both engines) | genuine | genuine | yes, it is Chrome |
+
+browserless and LightPanda are still in `docker\compose.yml` as optional `extras`.
+
 ## Requirements
 
 - Windows 10 or 11 (x64 or ARM64)
 - Google Chrome or Microsoft Edge, for JavaScript-heavy pages
 - Windows PowerShell 5.1 (built into Windows)
 - Optional: [Tailscale](https://tailscale.com), to use the crawler from other devices
+- Optional: [Docker Desktop](https://www.docker.com/products/docker-desktop/), for the Docker engine (search, Chrome-grade HTTP fetching, Camoufox)
 
 The tray app is compiled with the C# compiler that ships with Windows (.NET Framework 4.x). There is nothing extra to install.
 
@@ -81,6 +115,7 @@ git clone https://github.com/gourneau/local-crawl.git
 cd local-crawl
 .\setup.ps1           # downloads fastCRW and verifies its SHA-256 checksums
 .\tray\install.ps1    # builds the tray app and adds Desktop + Start Menu shortcuts
+.\setup.ps1 -Docker   # optional: prepares the Docker engine (~15 min the first time)
 ```
 
 A globe icon appears in the system tray. Click it, then choose **Start crawler**. Test it:
@@ -166,7 +201,7 @@ Claude has its own web fetch. You need to tell it to read pages with crw instead
 
 **Why bother?** Claude's built-in fetch identifies itself as `Claude-User`, doesn't run JavaScript, and refuses some domains outright. crw looks like a normal Chrome browser. In one side-by-side test on bot-protected sites (Reddit, Zillow, Glassdoor, Amazon, NYT), the built-in fetch read 0 of 5 and crw read all 5.
 
-crw has no search tool, so let Claude keep its built-in web search for finding pages.
+With the local engine, crw has no search tool, so let Claude keep its built-in web search for finding pages. The Docker engine adds `crw_search`, but built-in search works fine either way.
 
 **Minimal version.** One line is enough:
 
@@ -260,6 +295,8 @@ If you close that window, Chrome exits. JS pages then stop rendering until you c
 | API and browser ports (default `3002`, `9223`) | Top of `crawl.ps1`. The tray app reads them from there. |
 | robots.txt, request rate, concurrency, render timeouts | `config.local.toml` |
 | Which browser to use | `$env:CRW_BROWSER`, else Chrome for Testing in `browser\chrome-win64\`, else installed Chrome, else Edge |
+| Engine (local / docker) | Tray **Options**, or `-Engine` on `crawl.ps1` (default: whichever was last running, else `local`) |
+| Docker engine settings | `docker\config.docker.toml`, `docker\compose.yml`, `docker\searxng\settings.yml` |
 | Browser mode (hidden / visible / headless) | Tray **Options**, or `-Browser` on `crawl.ps1` (default `hidden`) |
 | DevTools commands the filter swallows | `$FilterDrop` at the top of `crawl.ps1` (default `Runtime.enable`), or `$env:CRAWL_FILTER_DROP` |
 | fastCRW version | `.\setup.ps1 -Version x.y.z` (stop the crawler first) |
@@ -280,7 +317,8 @@ crw's limit on *incoming* API requests is turned off (`rate_limit_rps = 0`). Its
 | Tray icon is amber while running | The browser was closed. Click **Restart**. |
 | A page comes back as a short "continue shopping" or "just a moment" page | That's a bot wall the plain HTTP fetch didn't get past. Retry with `"renderJs": true` (Amazon product pages often need this). |
 | A site blocks every request, even ones that used to work | Your IP has been flagged, often after many requests in a short time. Wait a while, then slow down. |
-| `/v1/search` returns 503 | Search needs a [SearXNG](https://docs.fastcrw.com/) backend, which isn't set up here. |
+| `/v1/search` returns 503, or there's no `crw_search` tool | Search needs the Docker engine, which runs SearXNG. |
+| Search returns few or no results | Search engines rate-limit and CAPTCHA self-hosted SearXNG. The config enables extra engines; in testing, Bing kept answering while others were suspended. Suspensions lift after a while. |
 | `json` / `summary` formats or `/v1/extract` fail | They need an LLM API key in `[extraction.llm]`. |
 
 The logs are in `logs\`: `crw-server.log`, plus `browser.log` for Chrome.
@@ -294,6 +332,7 @@ config.local.toml   crawler settings (crw loads it from this folder)
 start.cmd, stop.cmd double-click wrappers
 tray\               tray app source (C#) and install.ps1
 filter\             DevTools filter source (C#), built into bin\cdp-filter.exe by setup.ps1
+docker\             the Docker engine: compose.yml, crw config, SearXNG settings
 bin\                fastCRW binaries (created by setup.ps1, not committed)
 logs\, run\         logs and process state (not committed)
 .chrome-profile\    the crawler's private Chrome profile (not committed)
@@ -303,11 +342,13 @@ logs\, run\         logs and process state (not committed)
 
 1. Choose **Exit** in the tray, and answer **Yes** to stop the crawler. Or run `.\crawl.ps1 stop`.
 2. If you shared it over Tailscale, run `tailscale serve reset`.
-3. Delete the `Local Crawler` shortcuts from the Desktop and Start Menu, then delete this folder.
+3. If you used the Docker engine, remove its images: `docker image rm local-crawl/crw:0.37.2-stealth ghcr.io/jo-inc/camofox-browser searxng/searxng:2026.5.9-0cba32c15`.
+4. Delete the `Local Crawler` shortcuts from the Desktop and Start Menu, then delete this folder.
 
 ## Credits and license
 
 - [fastCRW](https://github.com/fastcrw/crw) does the actual crawling. It is licensed AGPL-3.0. This repo doesn't include its binaries; `setup.ps1` downloads them from fastCRW's official GitHub releases and checks them against the published SHA-256 checksums.
-- The scripts and tray app in this repo are MIT licensed; see [LICENSE](LICENSE).
+- The Docker engine also uses [Camoufox](https://github.com/daijro/camoufox) via [camofox-browser](https://github.com/jo-inc/camofox-browser) (its crash telemetry is turned off) and [SearXNG](https://github.com/searxng/searxng) (AGPL-3.0).
+- The scripts, tray app and filter in this repo are MIT licensed; see [LICENSE](LICENSE).
 
-Please crawl responsibly. Respect robots.txt and site terms, and keep request rates modest. Heavy crawling from a home IP can get that IP rate-limited or blocked.
+The configs ignore robots.txt (`respect_robots_txt = false`), but keep a modest request rate of 3 per second per site. Please respect site terms. Heavy crawling from a home IP can get that IP rate-limited or blocked.

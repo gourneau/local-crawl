@@ -32,7 +32,15 @@ param(
     [string]$Browser = 'hidden',
 
     # Same as -Browser visible (kept for older scripts).
-    [switch]$Headed
+    [switch]$Headed,
+
+    # local:  crw-server.exe + your Chrome + the DevTools filter (the default).
+    # docker: fastCRW's Docker stack with every stealth tier (impersonated HTTP,
+    #         LightPanda, browserless stealth Chrome, Camoufox) plus SearXNG search.
+    #         Needs Docker Desktop and a one-time `.\setup.ps1 -Docker`.
+    # Defaults to whichever engine is running (for restart), else local.
+    [ValidateSet('local', 'docker')]
+    [string]$Engine
 )
 if ($Headed) { $Browser = 'visible' }
 
@@ -58,6 +66,11 @@ $ProfileDir = Join-Path $Root '.chrome-profile'
 $ApiUrl     = "http://127.0.0.1:$ApiPort"
 # The running browser's mode ('hidden', 'visible' or 'headless'); also read by the tray app.
 $BrowserModeFile = Join-Path $RunDir 'browser.mode'
+# The running engine ('local' or 'docker'); also read by the tray app.
+$EngineFile  = Join-Path $RunDir 'engine'
+$DockerDir   = Join-Path $Root 'docker'
+$ComposeFile = Join-Path $DockerDir 'compose.yml'
+$DockerImage = 'local-crawl/crw:0.37.2-stealth'
 
 $BrowserCandidates = @(
     $env:CRW_BROWSER,
@@ -360,9 +373,7 @@ function Start-Crw([int]$DevToolsPort) {
     }
 }
 
-function Invoke-Start {
-    New-Item -ItemType Directory -Force -Path $RunDir, $LogDir | Out-Null
-    Write-Host "Starting local crawler..."
+function Start-LocalEngine {
     try {
         Start-Browser
         $devToolsPort = Start-Filter
@@ -374,6 +385,127 @@ function Invoke-Start {
         Stop-Browser
         throw
     }
+}
+
+# --- Docker engine --------------------------------------------------------------
+# Runs a docker command and returns its output, throwing with that output if it fails.
+# (A simple function, so arguments like "-f" pass straight through in $args.)
+function Invoke-Docker {
+    $ErrorActionPreference = 'Continue'   # docker writes progress to stderr
+    $out = & docker @args 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "docker $($args -join ' ') failed: $($out.Trim())" }
+    $out
+}
+
+# "--profile extras" makes stop and status also cover the optional containers.
+function Invoke-Compose { Invoke-Docker compose -f $ComposeFile --profile extras @args }
+
+function Test-DockerDaemon {
+    if (-not (Get-Command docker -ErrorAction SilentlyContinue)) { return $false }
+    $ErrorActionPreference = 'Continue'
+    $null = & docker info --format '{{.ServerVersion}}' 2>&1
+    return $LASTEXITCODE -eq 0
+}
+
+function Test-DockerEngineRunning {
+    if (-not (Test-DockerDaemon)) { return $false }
+    $ErrorActionPreference = 'Continue'
+    $ids = & docker compose -f $ComposeFile --profile extras ps -q 2>$null
+    return [bool]$ids
+}
+
+function Start-DockerDesktop {
+    if (Test-DockerDaemon) { return }
+    $desktop = "$env:ProgramFiles\Docker\Docker\Docker Desktop.exe"
+    if (-not (Test-Path $desktop)) { throw "Docker isn't running and Docker Desktop wasn't found. Start Docker, or use the local engine." }
+    Write-Host "  starting Docker Desktop..."
+    Start-Process $desktop
+    $deadline = (Get-Date).AddSeconds(180)
+    while ((Get-Date) -lt $deadline) {
+        if (Test-DockerDaemon) { return }
+        Start-Sleep -Seconds 3
+    }
+    throw "Docker Desktop didn't become ready within 3 minutes."
+}
+
+# Random secrets for the browserless token and SearXNG, created once in docker\.env.
+function Initialize-DockerEnv {
+    $envFile = Join-Path $DockerDir '.env'
+    if (Test-Path $envFile) { return }
+    $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+    $hex = {
+        param([int]$Bytes)
+        $buf = New-Object byte[] $Bytes
+        $rng.GetBytes($buf)
+        -join ($buf | ForEach-Object { $_.ToString('x2') })
+    }
+    Set-Content -Path $envFile -Encoding ascii -Value @(
+        "BROWSERLESS_TOKEN=$(& $hex 24)",
+        "SEARXNG_SECRET_KEY=$(& $hex 32)")
+}
+
+function Start-DockerEngine {
+    Start-DockerDesktop
+    Initialize-DockerEnv
+    $ErrorActionPreference = 'Continue'
+    $null = & docker image inspect $DockerImage 2>&1
+    $ErrorActionPreference = 'Stop'
+    if ($LASTEXITCODE -ne 0) {
+        throw "The Docker engine isn't set up yet. Run .\setup.ps1 -Docker once (the first build takes a while)."
+    }
+    Assert-PortFree $ApiPort 'the Docker engine'
+
+    # The Docker crw renders with the host's real Chrome, through the DevTools filter.
+    try {
+        Start-Browser
+        $devToolsPort = Start-Filter
+        $env:CRW_CDP_PORT = "$devToolsPort"
+        $realUa = Get-BrowserUserAgent
+        if ($realUa) { $env:CRW_USER_AGENT = $realUa }
+
+        Write-Host "  starting containers..."
+        $null = Invoke-Docker compose -f $ComposeFile up -d --no-build
+        if (-not (Wait-Url "$ApiUrl/health" 120)) {
+            throw "The Docker engine didn't become healthy within 2 minutes. See: docker compose -f docker\compose.yml logs crw"
+        }
+    } catch {
+        Stop-DockerEngine
+        Stop-Tracked 'cdp-filter' @('cdp-filter')
+        Stop-Browser
+        throw
+    }
+    Write-Host "  docker engine up ($ApiUrl)"
+}
+
+function Stop-DockerEngine {
+    if (Test-DockerEngineRunning) {
+        $null = Invoke-Compose down
+        Write-Host "  stopped docker engine"
+    }
+}
+
+function Get-RunningEngine {
+    $engine = Get-Content $EngineFile -Raw -ErrorAction SilentlyContinue
+    if ($engine) { return $engine.Trim() }
+    return $null
+}
+
+# --- Start / stop / status ------------------------------------------------------
+function Invoke-Start {
+    New-Item -ItemType Directory -Force -Path $RunDir, $LogDir | Out-Null
+    $engine = $Engine
+    if (-not $engine) { $engine = Get-RunningEngine }
+    if (-not $engine) { $engine = 'local' }
+    $running = Get-RunningEngine
+    if ($running -and $running -ne $engine) { Invoke-Stop }   # switching engines
+
+    Write-Host "Starting crawler ($engine engine)..."
+    if ($engine -eq 'docker') {
+        Start-DockerEngine
+    } else {
+        Start-LocalEngine
+    }
+    Set-Content -Path $EngineFile -Value $engine -NoNewline
     Write-Host ""
     Write-Host "Ready. API:  $ApiUrl  (Firecrawl-compatible: /v1/scrape, /v1/crawl, /v1/map)"
     Write-Host "Try:         .\crawl.ps1 scrape https://example.com"
@@ -381,14 +513,22 @@ function Invoke-Start {
 }
 
 function Invoke-Stop {
-    Write-Host "Stopping local crawler..."
+    Write-Host "Stopping crawler..."
     Stop-Tracked 'crw-server' @('crw-server')
     Stop-Tracked 'cdp-filter' @('cdp-filter')
     Stop-Browser
+    Stop-DockerEngine
+    Remove-Item $EngineFile -Force -ErrorAction SilentlyContinue
     Write-Host "Stopped."
 }
 
 function Invoke-Status {
+    $docker = (Get-RunningEngine) -eq 'docker'
+    if ($docker) {
+        $health = if (Test-Url "$ApiUrl/health") { 'healthy' } else { 'NOT responding' }
+        Write-Host "engine     : docker, $health at $ApiUrl"
+        if (Test-DockerDaemon) { Write-Host (Invoke-Compose ps --format 'table {{.Service}}\t{{.State}}\t{{.Status}}').TrimEnd() }
+    }
     $crw = Get-Tracked 'crw-server' @('crw-server')
     $browserProc = Get-Browser
 
@@ -396,7 +536,7 @@ function Invoke-Status {
         $mb = [math]::Round($crw.WorkingSet64 / 1MB, 1)
         $health = if (Test-Url "$ApiUrl/health") { 'healthy' } else { 'NOT responding' }
         Write-Host "crw-server : running, PID $($crw.Id), $mb MB, $health at $ApiUrl"
-    } else {
+    } elseif (-not $docker) {
         Write-Host "crw-server : stopped"
     }
 
@@ -435,9 +575,20 @@ try {
     switch ($Command) {
         'start'   { Invoke-Start }
         'stop'    { Invoke-Stop }
-        'restart' { Invoke-Stop; Invoke-Start }
+        'restart' {
+            $previous = Get-RunningEngine
+            if (-not $Engine -and $previous) { $Engine = $previous }
+            Invoke-Stop
+            Invoke-Start
+        }
         'status'  { Invoke-Status }
-        'logs'    { Get-Content (Join-Path $LogDir 'crw-server.log') -Tail 40 -Wait }
+        'logs'    {
+            if ((Get-RunningEngine) -eq 'docker') {
+                & docker compose -f $ComposeFile logs -f --tail 40 crw
+            } else {
+                Get-Content (Join-Path $LogDir 'crw-server.log') -Tail 40 -Wait
+            }
+        }
         'scrape'  { Invoke-Scrape }
     }
 } catch {
