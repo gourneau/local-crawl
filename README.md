@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/gourneau/local-crawl/actions/workflows/ci.yml/badge.svg)](https://github.com/gourneau/local-crawl/actions/workflows/ci.yml)
 
-Run the [fastCRW](https://github.com/fastcrw/crw) web crawler natively on Windows, with no Docker and no WSL. You get:
+Run the [fastCRW](https://github.com/fastcrw/crw) web crawler natively on Windows. The default setup needs neither Docker nor WSL; a Docker engine is optional. You get:
 
 - A **system tray on/off switch**.
 - **JavaScript rendering** through your installed Chrome or Edge.
@@ -141,7 +141,7 @@ If you don't want the tray app, skip `tray\install.ps1` and use `.\crawl.ps1 sta
 Left- or right-click the icon for the menu:
 
 - **Start / Stop crawler** and **Restart**
-- **Options** chooses the browser mode: **Hidden window (most realistic)**, **Visible window (for debugging)** or **Headless (lightest, easiest to detect)**. The tray remembers the choice.
+- **Options** chooses the engine, **Local engine** or **Docker engine**, and the browser mode: **Hidden window (most realistic)**, **Visible window (for debugging)** or **Headless (lightest, easiest to detect)**. The tray remembers both choices.
 - **Show live log** opens a console window that follows the server log.
 - **Open logs folder**, **Open crawler folder**, **Copy API URL**
 - **Exit** asks whether to stop the crawler or leave it running in the background.
@@ -153,13 +153,14 @@ The source is in `tray\`. After editing it, run `.\tray\install.ps1` again. Use 
 ## Command line
 
 ```powershell
-.\crawl.ps1 start            # start Chrome + crw-server, wait until healthy
+.\crawl.ps1 start            # start Chrome, the filter and crw-server, wait until healthy
 .\crawl.ps1 start -Browser visible    # same, with an on-screen browser window
 .\crawl.ps1 start -Browser headless   # no window at all (lightest, easiest to detect)
+.\crawl.ps1 start -Engine docker      # the Docker engine (run .\setup.ps1 -Docker once first)
 .\crawl.ps1 status           # running? healthy? memory? browser mode?
 .\crawl.ps1 stop
-.\crawl.ps1 restart          # add -Browser <mode> to switch modes
-.\crawl.ps1 logs             # follow logs\crw-server.log
+.\crawl.ps1 restart          # add -Browser <mode> or -Engine <local|docker> to switch
+.\crawl.ps1 logs             # follow logs\crw-server.log (Docker engine: docker compose logs for crw)
 .\crawl.ps1 scrape <url>     # print one page as markdown
 ```
 
@@ -299,7 +300,7 @@ Good to know:
 
 - **Plain `http` is fine here.** Tailscale encrypts the traffic between devices. If a client insists on `https`, turn on HTTPS certificates in the Tailscale admin console and serve with `--https=443` instead.
 - **The crawler must be running** (tray icon green). Otherwise remote clients get errors.
-- **There's no API key**, so every device on your tailnet can use it. If you share your tailnet, add `[auth] api_keys` in `config.local.toml`.
+- **There's no API key**, so every device on your tailnet can use it. If you share your tailnet, add `[auth] api_keys` in `config.local.toml` (local engine) or `docker\config.docker.toml` (Docker engine).
 - **To stop sharing:** `& "C:\Program Files\Tailscale\tailscale.exe" serve reset`
 
 ### From your phone
@@ -324,16 +325,16 @@ If you close that window, Chrome exits. JS pages then stop rendering until you c
 
 | What | Where |
 |---|---|
-| API and browser ports (default `3002`, `9223`) | Top of `crawl.ps1`. The tray app reads them from there. |
+| Ports: API `3002`, DevTools filter `9223`, Chrome `9224` | `$ApiPort`, `$CdpPort` and `$ChromePort` at the top of `crawl.ps1`. The tray app reads them from there. The Docker engine also hard-codes the API port in `docker\compose.yml` (`127.0.0.1:3002:3000`), so change it there too. |
 | robots.txt, request rate, concurrency, render timeouts | `config.local.toml` |
 | Which browser to use | `$env:CRW_BROWSER`, else Chrome for Testing in `browser\chrome-win64\`, else installed Chrome, else Edge |
 | Engine (local / docker) | Tray **Options**, or `-Engine` on `crawl.ps1` (default: whichever was last running, else `local`) |
 | Docker engine settings | `docker\config.docker.toml`, `docker\compose.yml`, `docker\searxng\settings.yml` |
 | Browser mode (hidden / visible / headless) | Tray **Options**, or `-Browser` on `crawl.ps1` (default `hidden`) |
-| DevTools commands the filter swallows | `$FilterDrop` at the top of `crawl.ps1` (default `Runtime.enable`), or `$env:CRAWL_FILTER_DROP` |
+| DevTools commands the filter swallows | `$FilterDrop` at the top of `crawl.ps1` (default `Runtime.enable,Fetch.enable`), or `$env:CRAWL_FILTER_DROP` |
 | fastCRW version | `.\setup.ps1 -Version x.y.z` (stop the crawler first) |
 
-The defaults are polite: robots.txt is respected, with 3 requests per second and 5 concurrent requests.
+The defaults keep the request rate polite, 3 requests per second and 5 concurrent requests, but ignore robots.txt (`respect_robots_txt = false` in both configs).
 
 crw's limit on *incoming* API requests is turned off (`rate_limit_rps = 0`). Its default of 10 per second is shared by all clients. MCP apps like Claude Desktop open several connections at once on startup, and some were refused with HTTP 429. This doesn't change how fast sites are crawled. The full option list is in the [fastCRW configuration docs](https://docs.fastcrw.com/configuration/).
 
@@ -345,7 +346,7 @@ crw's limit on *incoming* API requests is turned off (`rate_limit_rps = 0`). Its
 |---|---|
 | Pages are slow, or fall back to Chrome often | crw's direct HTTP fetch has a hardcoded 2.5 s connect timeout, so a weak Wi-Fi link misses it. Pages still come back via Chrome, just slower. A better connection fixes it. |
 | Garbled characters (`Ã©`, `â€™`) in PowerShell | Windows PowerShell 5.1's `Invoke-RestMethod` decodes this API as Latin-1. Use `curl.exe`, PowerShell 7, or `.\crawl.ps1 scrape`. |
-| "Port 3002 is already used by …" | Another app has the port. Change `$ApiPort` at the top of `crawl.ps1`. |
+| "Port … is already used by …" | Another app has the port. Change it at the top of `crawl.ps1`: `$ApiPort` (3002), `$CdpPort` (9223, the filter) or `$ChromePort` (9224, Chrome). For the Docker engine, also change `3002` in `docker\compose.yml`. |
 | Tray icon is amber while running | The browser was closed. Click **Restart**. |
 | A page comes back as a short "continue shopping" or "just a moment" page | That's a bot wall the plain HTTP fetch didn't get past. Retry with `"renderJs": true` (Amazon product pages often need this). |
 | A site blocks every request, even ones that used to work | Your IP has been flagged, often after many requests in a short time. Wait a while, then slow down. |
@@ -353,19 +354,22 @@ crw's limit on *incoming* API requests is turned off (`rate_limit_rps = 0`). Its
 | Search returns few, no, or unrelated results | Public search engines rate-limit, CAPTCHA, or block self-hosted SearXNG. In one test, every engine except Bing was blocked, and Bing answered "fastcrw web scraper" with running shoes. Check with `docker exec local-crawl-searxng-1 wget -qO- "http://localhost:8080/search?format=json&q=test"` and look at `unresponsive_engines`. Use your AI client's built-in web search instead. |
 | `json` / `summary` formats or `/v1/extract` fail | They need an LLM API key in `[extraction.llm]`. |
 
-The logs are in `logs\`: `crw-server.log`, plus `browser.log` for Chrome.
+The logs are in `logs\`: `crw-server.log` and `crw-server.err.log` for the local engine's server, `cdp-filter.log` for the filter, and `browser.log` and `browser.out.log` for Chrome. The Docker engine's containers log to Docker; `.\crawl.ps1 logs` follows crw's.
 
 ## Project layout
 
 ```
 crawl.ps1           start / stop / status / logs / scrape
-setup.ps1           downloads + verifies the fastCRW binaries into bin\
+setup.ps1           downloads + verifies the fastCRW binaries into bin\, builds cdp-filter.exe
 config.local.toml   crawler settings (crw loads it from this folder)
 start.cmd, stop.cmd double-click wrappers
 tray\               tray app source (C#) and install.ps1
 filter\             DevTools filter source (C#), built into bin\cdp-filter.exe by setup.ps1
 docker\             the Docker engine: compose.yml, crw config, SearXNG settings
-bin\                fastCRW binaries (created by setup.ps1, not committed)
+.github\            CI: scripts parse, C# compiles, compose file is valid
+bin\                fastCRW binaries and cdp-filter.exe (created by setup.ps1, not committed)
+LocalCrawler.exe    the tray app (built by tray\install.ps1, not committed)
+docker\.env         the Docker engine's SearXNG secret (created by crawl.ps1, not committed)
 logs\, run\         logs and process state (not committed)
 .chrome-profile\    the crawler's private Chrome profile (not committed)
 ```

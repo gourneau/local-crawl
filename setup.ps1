@@ -1,11 +1,14 @@
 <#
 .SYNOPSIS
-  Download the fastCRW Windows binaries into bin\ and verify their SHA-256 checksums.
+  Download the fastCRW Windows binaries into bin\ and verify their SHA-256 checksums,
+  then build the DevTools filter, bin\cdp-filter.exe.
 
 .DESCRIPTION
   Fetches crw-server, crw (CLI) and crw-mcp from the official fastCRW GitHub release,
   checks each zip against the release's SHA256SUMS file, and unpacks the .exe files
-  into bin\. Safe to re-run; pass -Version to upgrade or pin a different release.
+  into bin\. Then builds cdp-filter.exe from filter\CdpFilter.cs with the C# compiler
+  that ships with Windows. Safe to re-run; pass -Version to upgrade or pin a different
+  release.
 
 .EXAMPLE
   .\setup.ps1

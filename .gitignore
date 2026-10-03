@@ -1,8 +1,10 @@
-# Downloaded by setup.ps1
+# Downloaded and built by setup.ps1
 bin/
+
+# Optional pinned Chrome for Testing, unzipped by hand (see README)
 browser/
 
-# Docker engine secrets (created by crawl.ps1)
+# Docker engine secret (created by crawl.ps1)
 docker/.env
 
 # Runtime state
