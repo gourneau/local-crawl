@@ -11,13 +11,20 @@ using System.Web.Script.Serialization;
 
 // A small Chrome DevTools Protocol proxy between crw-server and Chrome.
 //
-// It passes every message through untouched, except the two things that make crw's
-// browser look *less* like a real one:
-//   - crw's injected "stealth" script, which fakes a Mac GPU and patches navigator
-//     properties in ways fingerprinting scripts detect;
-//   - crw's User-Agent override, which blanks Chrome's client hints.
-// Chrome then presents its own, genuine fingerprint. Those commands get a
-// success reply so crw carries on as normal.
+// It passes every message through untouched, except:
+//   - crw's injected "stealth" script (Page.addScriptToEvaluateOnNewDocument), which
+//     fakes a Mac GPU and patches navigator properties in ways fingerprinting scripts
+//     detect;
+//   - crw's User-Agent override (Network.setUserAgentOverride), which blanks Chrome's
+//     client hints;
+//   - any commands in the --drop list, e.g. Runtime.enable and Fetch.enable.
+// Those commands get a success reply so crw carries on as normal, and Chrome presents
+// its own, genuine fingerprint.
+//
+// It also rewrites the Host header to 127.0.0.1, because Chrome only answers DevTools
+// requests addressed to an IP or "localhost" (crw in Docker connects as
+// host.docker.internal), and points the WebSocket URLs in Chrome's /json replies back
+// at the filter, under the name the client used.
 //
 // Usage: cdp-filter.exe --listen 9223 --upstream 9224 [--log path] [--drop Method1,Method2]
 //   --drop  extra DevTools commands to answer with an empty success instead of
@@ -32,7 +39,7 @@ static class CdpFilter
     static string _logPath;
     static readonly HashSet<string> DropMethods = new HashSet<string> { "Network.setUserAgentOverride" };
     static readonly object LogLock = new object();
-    static readonly Dictionary<string, int> MethodCounts = new Dictionary<string, int>();
+    static readonly HashSet<string> SeenMethods = new HashSet<string>();
     static readonly Regex MethodPattern = new Regex("\"method\"\\s*:\\s*\"([^\"]+)\"");
     static readonly Regex HostHeader = new Regex("(?im)^Host:[ \\t]*([^\\r\\n]*)\\r\\n");
     static readonly Regex ConnectionHeader = new Regex("(?im)^Connection:[^\\r\\n]*\\r\\n");
@@ -207,7 +214,7 @@ static class CdpFilter
         Match match = MethodPattern.Match(message);
         if (!match.Success) return null;
         string method = match.Groups[1].Value;
-        CountMethod(method);
+        LogFirstSeen(method);
         if (method != "Page.addScriptToEvaluateOnNewDocument" &&
             method != "Page.removeScriptToEvaluateOnNewDocument" &&
             !DropMethods.Contains(method))
@@ -239,7 +246,7 @@ static class CdpFilter
         }
         if (result == null) return null;
 
-        CountMethod("(dropped) " + method);
+        LogFirstSeen("(dropped) " + method);
         StringBuilder reply = new StringBuilder("{\"id\":");
         reply.Append(Convert.ToString(command["id"], CultureInfo.InvariantCulture));
         reply.Append(",\"result\":").Append(result);
@@ -248,16 +255,10 @@ static class CdpFilter
     }
 
     // Logs each command name the first time it's seen, so you can audit what crw sends.
-    static void CountMethod(string method)
+    static void LogFirstSeen(string method)
     {
         bool first;
-        lock (MethodCounts)
-        {
-            int count;
-            MethodCounts.TryGetValue(method, out count);
-            MethodCounts[method] = count + 1;
-            first = count == 0;
-        }
+        lock (SeenMethods) { first = SeenMethods.Add(method); }
         if (first) Log("first seen: " + method);
     }
 
@@ -402,18 +403,6 @@ static class CdpFilter
             }
         }
         return false;
-    }
-
-    static void Copy(Stream from, Stream to)
-    {
-        byte[] buffer = new byte[65536];
-        try
-        {
-            int n;
-            while ((n = from.Read(buffer, 0, buffer.Length)) > 0) to.Write(buffer, 0, n);
-        }
-        catch (IOException) { }
-        catch (ObjectDisposedException) { }
     }
 
     static void Log(string message)
