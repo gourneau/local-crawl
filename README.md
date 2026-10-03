@@ -191,15 +191,32 @@ See the [fastCRW API docs](https://docs.fastcrw.com/) for the full set of option
 
 The MCP endpoint is `http://127.0.0.1:3002/mcp`, using the streamable HTTP transport.
 
-**Claude Code on the same PC:**
+**Claude Code on the same PC.** This also covers the **Code** tab of the Claude desktop app, which reads the same user config (`%USERPROFILE%\.claude.json`):
 
 ```powershell
 claude mcp add --scope user --transport http crw http://127.0.0.1:3002/mcp
 ```
 
-Agents get these tools: `crw_scrape`, `crw_crawl`, `crw_check_crawl_status`, `crw_map`, `crw_extract`, `crw_check_extract_status`, `crw_cancel_extract` and `crw_parse_file`.
+If `claude` isn't on your PATH because you only have the desktop app, it ships a copy at `%APPDATA%\Claude\claude-code\<version>\<id>\claude.exe`.
 
-If a client only supports stdio MCP, run `bin\crw-mcp.exe --api-url http://127.0.0.1:3002 --hide-credits` as the command.
+**Claude Desktop chat on the same PC.** Its config file only takes stdio servers, so use the bundled `crw-mcp.exe` bridge (no Node.js needed). Add this to `%APPDATA%\Claude\claude_desktop_config.json`, keeping whatever else is in the file, and change the path to where you cloned the repo:
+
+```json
+{
+  "mcpServers": {
+    "crw": {
+      "command": "C:\\path\\to\\local-crawl\\bin\\crw-mcp.exe",
+      "args": ["--api-url", "http://127.0.0.1:3002", "--hide-credits"]
+    }
+  }
+}
+```
+
+Then fully quit Claude (tray icon → **Quit**) and reopen it.
+
+Agents get these tools: `crw_scrape`, `crw_crawl`, `crw_check_crawl_status`, `crw_map`, `crw_extract`, `crw_check_extract_status`, `crw_cancel_extract` and `crw_parse_file`, plus `crw_search` with the Docker engine.
+
+For any other client that only supports stdio MCP, use the same `crw-mcp.exe` command.
 
 ## Telling Claude to use it
 
@@ -222,7 +239,7 @@ To read web pages, use the crw MCP tools (`crw_scrape`; `crw_map`/`crw_crawl` fo
 
 Finding pages and reading pages use different tools:
 
-- **Finding pages:** use your built-in web search. crw has no search tool. Never use crw to load search-engine result pages (Google, Bing, DuckDuckGo, etc.).
+- **Finding pages:** use your built-in web search. If it's unavailable, use `crw_search` (Docker engine only). Never use crw to load search-engine result pages (Google, Bing, DuckDuckGo, etc.).
 - **Reading pages:** use the crw MCP tools instead of the built-in web fetch. crw returns the full page as clean markdown and can render JavaScript.
   - `crw_scrape` reads one URL. If the result is empty, missing content, or a short interstitial ("continue shopping", "verify you are human", "just a moment"), retry with `renderJs: true`. Output is cut at about 15,000 characters; raise `maxLength` only if you need the rest.
   - `crw_map` lists a site's URLs without fetching them. Use it to pick pages, then scrape only those.
@@ -285,8 +302,19 @@ Good to know:
 - **Plain `http` is fine here.** Tailscale encrypts the traffic between devices. If a client insists on `https`, turn on HTTPS certificates in the Tailscale admin console and serve with `--https=443` instead.
 - **The crawler must be running** (tray icon green). Otherwise remote clients get errors.
 - **There's no API key**, so every device on your tailnet can use it. If you share your tailnet, add `[auth] api_keys` in `config.local.toml`.
-- **Phone and web apps won't work:** Claude's mobile and web connectors connect from the cloud, so they can't reach a tailnet address.
 - **To stop sharing:** `& "C:\Program Files\Tailscale\tailscale.exe" serve reset`
+
+### From your phone
+
+The Claude mobile app can't connect to the crawler directly. Its custom connectors are called from Anthropic's cloud, and the cloud can't reach a tailnet address.
+
+Use [Remote Control](https://code.claude.com/docs/en/remote-control) instead. It lets you drive a Claude Code session that runs on the PC, so the session uses the PC's MCP servers, crw included. It needs a Pro, Max, Team or Enterprise plan.
+
+1. On the PC, turn it on once. In the desktop app's settings, turn on **Connect new sessions to Remote Control**. In a terminal, run `claude remote-control` instead.
+2. Start a session on the PC, in the app's **Code** tab or the terminal.
+3. On the phone, open the Claude app (signed in to the same account) and open that session from its Claude Code sessions. Ask it to read a page and it uses `crw_scrape` on the PC.
+
+The phone needs no Tailscale for this, and the PC must stay awake with the crawler running. Exposing the crawler to the internet with Tailscale Funnel would let the cloud reach it, but crw would then be an open web proxy for anyone who finds the URL, so don't do that without an API key.
 
 ## Debugging with a visible browser
 
