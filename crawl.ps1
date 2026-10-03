@@ -272,9 +272,14 @@ function Start-Browser {
         'hidden' {
             # A real window parked off-screen, kept rendering at full speed even though
             # nothing can see it (Chrome otherwise throttles windows it thinks are covered).
+            # Size it to fit the real screen: a window bigger than the screen is a giveaway.
+            Add-Type -AssemblyName System.Windows.Forms
+            $work = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+            $width = [Math]::Min(1600, $work.Width - 40)
+            $height = [Math]::Min(1000, $work.Height - 40)
             $browserArgs = @(
                 '--window-position=-32000,-32000',
-                '--window-size=1600,1000',
+                "--window-size=$width,$height",
                 '--disable-backgrounding-occluded-windows',
                 '--disable-renderer-backgrounding',
                 '--disable-background-timer-throttling',

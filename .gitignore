@@ -5,7 +5,7 @@ browser/
 # Runtime state
 logs/
 run/
-.chrome-profile/
+.chrome-profile*/
 
 # Built by tray/install.ps1
 LocalCrawler.exe
