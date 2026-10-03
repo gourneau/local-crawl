@@ -3,15 +3,22 @@
   Start, stop, and check a local fastCRW crawl server on Windows.
 
 .DESCRIPTION
-  Runs two background processes:
+  Runs three background processes:
     - Chrome (or Edge) with a private profile, used to render JS-heavy pages
+    - cdp-filter.exe, a DevTools proxy between crw and Chrome that strips crw's
+      automation giveaways (source in filter\CdpFilter.cs, built by setup.ps1)
     - crw-server.exe, the Firecrawl-compatible REST API
 
-  Both bind to 127.0.0.1 only, so nothing is reachable from other machines.
+  With -Engine docker, crw runs in Docker instead (docker\compose.yml), adding
+  Chrome-impersonating HTTP, Camoufox and SearXNG search. It still renders JS pages
+  with the same Chrome, through the same filter.
+
+  Everything binds to 127.0.0.1 only, so nothing is reachable from other machines.
 
 .EXAMPLE
   .\crawl.ps1 start
   .\crawl.ps1 start -Browser visible   # watch pages render, for debugging
+  .\crawl.ps1 restart -Engine docker   # switch to the Docker engine
   .\crawl.ps1 status
   .\crawl.ps1 scrape https://example.com
   .\crawl.ps1 stop
@@ -31,9 +38,6 @@ param(
     [ValidateSet('hidden', 'visible', 'headless')]
     [string]$Browser = 'hidden',
 
-    # Same as -Browser visible (kept for older scripts).
-    [switch]$Headed,
-
     # local:  crw-server.exe + your Chrome + the DevTools filter (the default).
     # docker: fastCRW's Docker stack: Chrome-impersonating HTTP, Camoufox and SearXNG
     #         search, rendering JS pages with the same Chrome and filter.
@@ -42,13 +46,12 @@ param(
     [ValidateSet('local', 'docker')]
     [string]$Engine
 )
-if ($Headed) { $Browser = 'visible' }
 
 $ErrorActionPreference = 'Stop'
 
 # --- Settings -----------------------------------------------------------------
 $ApiPort    = 3002   # crw API: http://127.0.0.1:3002 (3000 is left free for dev servers)
-$CdpPort    = 9223   # DevTools port crw connects to (the filter, or Chrome if the filter is missing)
+$CdpPort    = 9223   # DevTools port crw connects to: the filter, which forwards to Chrome
 $ChromePort = 9224   # Chrome's own DevTools port, behind the filter
 
 # DevTools commands from crw that the filter answers itself instead of passing to Chrome
@@ -158,6 +161,7 @@ function Stop-Browser {
         & taskkill.exe /PID $proc.Id /T /F 2>&1 | Out-Null
         Write-Host "  stopped browser (PID $($proc.Id))"
     }
+    # Older versions wrote run\browser.pid; clear any leftover copy.
     Remove-Item (Get-PidFile 'browser') -Force -ErrorAction SilentlyContinue
     Remove-Item $BrowserModeFile -Force -ErrorAction SilentlyContinue
 }
@@ -309,7 +313,6 @@ function Start-Browser {
 
     if (Wait-Url "http://127.0.0.1:$ChromePort/json/version" 15) {
         $proc = Get-Browser
-        if ($proc) { Set-Content -Path (Get-PidFile 'browser') -Value $proc.Id -NoNewline }
         if ($proc -and $Browser -eq 'hidden') { Hide-BrowserWindow $proc $foreground }
         Write-Host "  browser up   ($(Split-Path $exe -Leaf), $Browser, DevTools on 127.0.0.1:$ChromePort)"
     } else {
@@ -318,16 +321,15 @@ function Start-Browser {
 }
 
 # The DevTools filter between crw and Chrome (see filter\CdpFilter.cs). It drops crw's
-# injected disguise script and User-Agent override so Chrome shows its real fingerprint.
-# Returns the port crw should connect to.
+# injected disguise script, its User-Agent override and the $FilterDrop commands, so
+# Chrome shows its real fingerprint. crw connects to it on $CdpPort.
 function Start-Filter {
     if (-not (Test-Path $FilterExe)) {
-        Write-Warning "Missing $FilterExe (run .\setup.ps1). crw will talk to Chrome directly and inject its own disguise."
-        return $ChromePort
+        throw "Missing $FilterExe (the DevTools filter). Run .\setup.ps1 to build it."
     }
     if (Get-Tracked 'cdp-filter' @('cdp-filter')) {
         Write-Host "  filter already running"
-        return $CdpPort
+        return
     }
     Assert-PortFree $CdpPort 'the DevTools filter'
     $filterArgs = @('--listen', $CdpPort, '--upstream', $ChromePort, '--log', "`"$(Join-Path $LogDir 'cdp-filter.log')`"")
@@ -338,10 +340,9 @@ function Start-Filter {
         throw "The DevTools filter did not start on port $CdpPort. See logs\cdp-filter.log."
     }
     Write-Host "  filter up    (127.0.0.1:$CdpPort -> Chrome)"
-    return $CdpPort
 }
 
-function Start-Crw([int]$DevToolsPort) {
+function Start-Crw {
     if (Get-Tracked 'crw-server' @('crw-server')) {
         Write-Host "  crw-server already running"
         return
@@ -352,7 +353,7 @@ function Start-Crw([int]$DevToolsPort) {
     # Environment variables override config.local.toml, so the ports live in one place (this file).
     $env:CRW_SERVER__HOST = '127.0.0.1'
     $env:CRW_SERVER__PORT = "$ApiPort"
-    $env:CRW_RENDERER__CHROME__WS_URL = "ws://127.0.0.1:$DevToolsPort/"
+    $env:CRW_RENDERER__CHROME__WS_URL = "ws://127.0.0.1:$CdpPort/"
 
     # crw presents a fixed "Chrome on Mac" User-Agent by default. Present the browser's
     # real one instead, so the header matches what page scripts see about the machine.
@@ -377,8 +378,8 @@ function Start-Crw([int]$DevToolsPort) {
 function Start-LocalEngine {
     try {
         Start-Browser
-        $devToolsPort = Start-Filter
-        Start-Crw $devToolsPort
+        Start-Filter
+        Start-Crw
     } catch {
         # Don't leave a half-started setup behind (e.g. a browser with no server).
         Stop-Tracked 'crw-server' @('crw-server')
@@ -456,8 +457,8 @@ function Start-DockerEngine {
     # The Docker crw renders with the host's real Chrome, through the DevTools filter.
     try {
         Start-Browser
-        $devToolsPort = Start-Filter
-        $env:CRW_CDP_PORT = "$devToolsPort"
+        Start-Filter
+        $env:CRW_CDP_PORT = "$CdpPort"
         $realUa = Get-BrowserUserAgent
         if ($realUa) { $env:CRW_USER_AGENT = $realUa }
 
