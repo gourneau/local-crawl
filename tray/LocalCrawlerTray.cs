@@ -129,7 +129,7 @@ class TrayContext : ApplicationContext
             Notify("Copied " + _apiUrl, ToolTipIcon.Info);
         });
         menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add("Exit", null, delegate { ExitTray(); });
+        menu.Items.Add("Exit (stops the crawler)", null, delegate { ExitTray(); });
 
         _icon = new NotifyIcon();
         _icon.Icon = _stoppedIcon;
@@ -375,23 +375,16 @@ class TrayContext : ApplicationContext
         }
     }
 
+    // Exiting the tray turns everything off: the crawler, its watchdog, and Docker Desktop
+    // if the crawler started it. Run even when the crawler looks stopped, so nothing it
+    // left half-running (a browser, a container) keeps using memory.
     void ExitTray()
     {
         if (_busy) return;
-        if (_state == CrawlerState.Running)
-        {
-            DialogResult answer = MessageBox.Show(
-                "Stop the crawler too?\n\nYes: stop it, then exit.\nNo: leave it running in the background.",
-                "Local Crawler", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
-            if (answer == DialogResult.Cancel) return;
-            if (answer == DialogResult.Yes)
-            {
-                UpdateUi(CrawlerState.Busy, "Stopping...");
-                string error = RunCrawlScript("stop");
-                if (error != null)
-                    MessageBox.Show(error, "Local Crawler", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            }
-        }
+        UpdateUi(CrawlerState.Busy, "Stopping...");
+        string error = RunCrawlScript("stop");
+        if (error != null)
+            MessageBox.Show(error, "Local Crawler", MessageBoxButtons.OK, MessageBoxIcon.Error);
         _poll.Stop();
         _icon.Visible = false;
         _icon.Dispose();

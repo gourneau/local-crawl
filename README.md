@@ -160,7 +160,7 @@ Left- or right-click the icon for the menu:
 - **Options** chooses the engine, **Local engine** or **Docker engine**, and the browser mode: **Hidden window (most realistic)**, **Visible window (for debugging)** or **Headless (lightest, easiest to detect)**. The tray remembers both choices.
 - **Show live log** opens a console window that follows the server log.
 - **Open logs folder**, **Open crawler folder**, **Copy API URL**
-- **Exit** asks whether to stop the crawler or leave it running in the background.
+- **Exit (stops the crawler)** turns everything off, then closes the tray. See [Turning it off](#turning-it-off).
 
 Windows 11 hides new tray icons by default. Click `^` on the taskbar to find it, or turn it on under **Settings → Personalization → Taskbar → Other system tray icons**.
 
@@ -181,6 +181,12 @@ The source is in `tray\`. After editing it, run `.\tray\install.ps1` again. Use 
 ```
 
 `start.cmd` and `stop.cmd` do the same as `start` and `stop` when double-clicked. Nothing starts at login unless you set that up yourself. After a reboot the crawler is off, including the Docker engine's containers, until you start it again.
+
+### Turning it off
+
+**Stop** in the tray, **Exit** in the tray, `.\crawl.ps1 stop` and `stop.cmd` all turn everything off: Chrome, the filter, crw, the watchdog and the Docker engine's containers. Nothing restarts them until you start the crawler again.
+
+On the Docker engine, stopping also quits Docker Desktop, so its Linux VM gives back its memory (about 2 GB). It stays running if other containers are using it, and on `restart`. To keep Docker Desktop running anyway, set `$QuitDockerDesktop = $false` at the top of `crawl.ps1`.
 
 ### The watchdog
 
@@ -401,7 +407,7 @@ logs\, run\         logs and process state (not committed)
 
 ## Uninstall
 
-1. Choose **Exit** in the tray, and answer **Yes** to stop the crawler. Or run `.\crawl.ps1 stop`.
+1. Choose **Exit** in the tray, which stops the crawler. Or run `.\crawl.ps1 stop`.
 2. If you shared it over Tailscale, run `tailscale serve reset`.
 3. If you used the Docker engine, remove its images: `docker image rm local-crawl/crw:0.37.2-fixes ghcr.io/jo-inc/camofox-browser searxng/searxng:2026.5.9-0cba32c15`.
 4. Delete the `Local Crawler` shortcuts from the Desktop and Start Menu, then delete this folder.

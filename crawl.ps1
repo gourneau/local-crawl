@@ -81,6 +81,9 @@ $EngineFile  = Join-Path $RunDir 'engine'
 $DockerDir   = Join-Path $Root 'docker'
 $ComposeFile = Join-Path $DockerDir 'compose.yml'
 $DockerImage = 'local-crawl/crw:0.37.2-fixes'
+# `stop` on the Docker engine also quits Docker Desktop, so its Linux VM frees its memory
+# (about 2 GB). It's left running when other containers are using it. $false keeps it up.
+$QuitDockerDesktop = $true
 
 $BrowserCandidates = @(
     $env:CRW_BROWSER,
@@ -129,8 +132,10 @@ function Wait-Url([string]$Url, [int]$Seconds) {
 function Assert-PortFree([int]$Port, [string]$What) {
     # Only listeners on loopback or all interfaces clash with our 127.0.0.1 bind. Others are
     # fine, e.g. `tailscale serve` forwarding the same port on the Tailscale address.
+    # PID 0 entries are sockets whose process already exited, e.g. Docker Desktop's port
+    # forwarder right after Docker restarts; nothing is serving on them.
     $owner = Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue |
-        Where-Object { $_.LocalAddress -in '127.0.0.1', '0.0.0.0', '::' } |
+        Where-Object { $_.LocalAddress -in '127.0.0.1', '0.0.0.0', '::' -and $_.OwningProcess -ne 0 } |
         Select-Object -First 1
     if ($owner) {
         $procName = (Get-Process -Id $owner.OwningProcess -ErrorAction SilentlyContinue).ProcessName
@@ -494,6 +499,20 @@ function Start-DockerEngine {
     Write-Host "  docker engine up ($ApiUrl)"
 }
 
+# Only for an explicit `stop`, never a restart. Runs after the crawler's containers are
+# gone, so any container still listed belongs to something else.
+function Stop-DockerDesktop {
+    if (-not $QuitDockerDesktop -or -not (Test-DockerDaemon)) { return }
+    if ((Invoke-Docker ps -q).Trim()) {
+        Write-Host "  left Docker Desktop running (other containers are using it)"
+        return
+    }
+    $ErrorActionPreference = 'Continue'
+    $null = & docker desktop stop 2>&1
+    $ErrorActionPreference = 'Stop'
+    Write-Host "  stopped Docker Desktop"
+}
+
 # `compose up` with the current settings. It starts any stopped container and recreates
 # crw only when a setting changed, such as the browser's User-Agent after Chrome updated.
 function Update-DockerEngine {
@@ -695,7 +714,11 @@ if ($Command -ne 'watch') { Remove-Item $LastErrorFile -Force -ErrorAction Silen
 try {
     switch ($Command) {
         'start'   { Invoke-Start }
-        'stop'    { Invoke-Stop }
+        'stop'    {
+            $wasDocker = (Get-RunningEngine) -eq 'docker'
+            Invoke-Stop
+            if ($wasDocker) { Stop-DockerDesktop }
+        }
         'restart' {
             $previous = Get-RunningEngine
             if (-not $Engine -and $previous) { $Engine = $previous }
