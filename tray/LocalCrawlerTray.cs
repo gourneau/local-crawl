@@ -83,7 +83,12 @@ class TrayContext : ApplicationContext
         _enginePreferenceFile = Path.Combine(_root, @"run\tray-engine");
         _preferredMode = ReadFile(_preferenceFile);
         if (_preferredMode != "visible" && _preferredMode != "headless") _preferredMode = "hidden";
-        _preferredEngine = ReadFile(_enginePreferenceFile) == "docker" ? "docker" : "local";
+        _preferredEngine = ReadFile(_enginePreferenceFile);
+        if (_preferredEngine != "docker" && _preferredEngine != "local")
+        {
+            // No saved choice: the Docker engine once setup.ps1 -Docker has prepared it here.
+            _preferredEngine = Directory.Exists(Path.Combine(_root, @"build\crw-src\.git")) ? "docker" : "local";
+        }
 
         _ui = new Control();
         IntPtr forceHandle = _ui.Handle;
@@ -99,7 +104,7 @@ class TrayContext : ApplicationContext
         _visibleItem = new ToolStripMenuItem("Visible window (for debugging)", null, delegate { SetBrowserMode("visible"); });
         _headlessItem = new ToolStripMenuItem("Headless (lightest, easiest to detect)", null, delegate { SetBrowserMode("headless"); });
         _localEngineItem = new ToolStripMenuItem("Local engine (no Docker needed)", null, delegate { SetEngine("local"); });
-        _dockerEngineItem = new ToolStripMenuItem("Docker engine (adds Chrome-grade HTTP, Camoufox, search)", null, delegate { SetEngine("docker"); });
+        _dockerEngineItem = new ToolStripMenuItem("Docker engine (recommended: scrape fixes, Camoufox, search)", null, delegate { SetEngine("docker"); });
         _optionsItem = new ToolStripMenuItem("Options");
         _optionsItem.DropDownItems.Add(_localEngineItem);
         _optionsItem.DropDownItems.Add(_dockerEngineItem);

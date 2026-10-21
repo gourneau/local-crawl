@@ -46,7 +46,10 @@ services:
       - "host.docker.internal:host-gateway"
     volumes:
       - ./config.docker.toml:/app/config.docker.toml:ro
-    restart: unless-stopped
+    # on-failure: restart after a crash, but not when Docker itself starts (after a
+    # reboot). The containers are no use without the Chrome and filter that
+    # crawl.ps1 runs on Windows, so the crawler stays off until it is started.
+    restart: on-failure
     mem_limit: 2g
     memswap_limit: 2g
     pids_limit: 512
@@ -61,7 +64,7 @@ services:
   # Web search backend for /v1/search and the crw_search MCP tool.
   searxng:
     image: searxng/searxng:2026.5.9-0cba32c15
-    restart: unless-stopped
+    restart: on-failure
     read_only: true
     cap_drop:
       - ALL
@@ -94,6 +97,6 @@ services:
       - CAMOFOX_PORT=9377
       - CAMOFOX_CRASH_REPORT_ENABLED=false
     shm_size: "2g"
-    restart: unless-stopped
+    restart: on-failure
     mem_limit: 3g
     memswap_limit: 3g

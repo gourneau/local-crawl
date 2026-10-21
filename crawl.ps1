@@ -9,23 +9,28 @@
       automation giveaways (source in filter\CdpFilter.cs, built by setup.ps1)
     - crw-server.exe, the Firecrawl-compatible REST API
 
-  With -Engine docker, crw runs in Docker instead (docker\compose.yml), adding
+  With the Docker engine (the default once `.\setup.ps1 -Docker` has run), crw runs in
+  Docker instead (docker\compose.yml), adding local-crawl's scrape fixes,
   Chrome-impersonating HTTP, Camoufox and SearXNG search. It still renders JS pages
   with the same Chrome, through the same filter.
+
+  While the crawler runs, a hidden watchdog (`crawl.ps1 watch`) brings back the
+  browser, the filter or the engine if one of them stops.
 
   Everything binds to 127.0.0.1 only, so nothing is reachable from other machines.
 
 .EXAMPLE
   .\crawl.ps1 start
   .\crawl.ps1 start -Browser visible   # watch pages render, for debugging
-  .\crawl.ps1 restart -Engine docker   # switch to the Docker engine
+  .\crawl.ps1 restart -Engine local    # switch to the local engine
   .\crawl.ps1 status
   .\crawl.ps1 scrape https://example.com
   .\crawl.ps1 stop
 #>
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('start', 'stop', 'restart', 'status', 'logs', 'scrape')]
+    # `watch` is the watchdog that `start` launches in the background; not for direct use.
+    [ValidateSet('start', 'stop', 'restart', 'status', 'logs', 'scrape', 'watch')]
     [string]$Command = 'status',
 
     [Parameter(Position = 1)]
@@ -38,11 +43,12 @@ param(
     [ValidateSet('hidden', 'visible', 'headless')]
     [string]$Browser = 'hidden',
 
-    # local:  crw-server.exe + your Chrome + the DevTools filter (the default).
-    # docker: fastCRW's Docker stack: Chrome-impersonating HTTP, Camoufox and SearXNG
-    #         search, rendering JS pages with the same Chrome and filter.
-    #         Needs Docker Desktop and a one-time `.\setup.ps1 -Docker`.
-    # Defaults to whichever engine is running (for restart), else local.
+    # local:  crw-server.exe + your Chrome + the DevTools filter.
+    # docker: fastCRW's Docker stack with local-crawl's scrape fixes: Chrome-impersonating
+    #         HTTP, Camoufox and SearXNG search, rendering JS pages with the same Chrome
+    #         and filter. Needs Docker Desktop and a one-time `.\setup.ps1 -Docker`.
+    # Defaults to whichever engine is running (for restart), else docker if it has been
+    # set up on this PC, else local.
     [ValidateSet('local', 'docker')]
     [string]$Engine
 )
@@ -148,10 +154,20 @@ function Stop-Tracked([string]$Name, [string[]]$ExpectedNames) {
 function Get-Browser {
     $conn = Get-NetTCPConnection -State Listen -LocalPort $ChromePort -ErrorAction SilentlyContinue |
         Select-Object -First 1
-    if (-not $conn) { return $null }
-    $info = Get-CimInstance Win32_Process -Filter "ProcessId=$($conn.OwningProcess)"
-    if (-not $info -or -not $info.CommandLine -or -not $info.CommandLine.Contains($ProfileDir)) { return $null }
-    return Get-Process -Id $info.ProcessId -ErrorAction SilentlyContinue
+    if ($conn) {
+        $info = Get-CimInstance Win32_Process -Filter "ProcessId=$($conn.OwningProcess)"
+        if ($info -and $info.CommandLine -and $info.CommandLine.Contains($ProfileDir)) {
+            return Get-Process -Id $info.ProcessId -ErrorAction SilentlyContinue
+        }
+    }
+    # A browser on our profile can also be running without its DevTools port, for example
+    # after Chrome relaunched itself to finish an update. Find its main process (the one
+    # without --type=) by command line, so it can still be stopped.
+    $main = Get-CimInstance Win32_Process -Filter "Name='chrome.exe' OR Name='msedge.exe'" |
+        Where-Object { $_.CommandLine -and $_.CommandLine.Contains($ProfileDir) -and $_.CommandLine -notmatch ' --type=' } |
+        Select-Object -First 1
+    if ($main) { return Get-Process -Id $main.ProcessId -ErrorAction SilentlyContinue }
+    return $null
 }
 
 function Stop-Browser {
@@ -159,6 +175,7 @@ function Stop-Browser {
     if ($proc) {
         # /T takes down Chrome's renderer/GPU child processes too.
         & taskkill.exe /PID $proc.Id /T /F 2>&1 | Out-Null
+        $null = $proc.WaitForExit(10000)
         Write-Host "  stopped browser (PID $($proc.Id))"
     }
     # Older versions wrote run\browser.pid; clear any leftover copy.
@@ -243,6 +260,11 @@ function Get-BrowserUserAgent {
 
 # --- Commands -----------------------------------------------------------------
 function Start-Browser {
+    if ((Get-Browser) -and -not (Test-Url "http://127.0.0.1:$ChromePort/json/version")) {
+        # Running, but useless to crw, and a new launch would only hand off to it.
+        Write-Host "  browser is running without DevTools (it may have relaunched after an update); restarting it"
+        Stop-Browser
+    }
     if (Get-Browser) {
         $current = Get-Content $BrowserModeFile -Raw -ErrorAction SilentlyContinue
         if ($current -and $current -ne $Browser) {
@@ -458,12 +480,8 @@ function Start-DockerEngine {
     try {
         Start-Browser
         Start-Filter
-        $env:CRW_CDP_PORT = "$CdpPort"
-        $realUa = Get-BrowserUserAgent
-        if ($realUa) { $env:CRW_USER_AGENT = $realUa }
-
         Write-Host "  starting containers..."
-        $null = Invoke-Compose up -d --no-build
+        Update-DockerEngine
         if (-not (Wait-Url "$ApiUrl/health" 120)) {
             throw "The Docker engine didn't become healthy within 2 minutes. See: docker compose -f docker\compose.yml logs crw"
         }
@@ -474,6 +492,15 @@ function Start-DockerEngine {
         throw
     }
     Write-Host "  docker engine up ($ApiUrl)"
+}
+
+# `compose up` with the current settings. It starts any stopped container and recreates
+# crw only when a setting changed, such as the browser's User-Agent after Chrome updated.
+function Update-DockerEngine {
+    $env:CRW_CDP_PORT = "$CdpPort"
+    $realUa = Get-BrowserUserAgent
+    if ($realUa) { $env:CRW_USER_AGENT = $realUa }
+    $null = Invoke-Compose up -d --no-build
 }
 
 function Stop-DockerEngine {
@@ -489,12 +516,97 @@ function Get-RunningEngine {
     return $null
 }
 
+# The Docker engine once `setup.ps1 -Docker` has prepared it here (it checks out
+# build\crw-src) and Docker is installed: it has local-crawl's scrape fixes. Else local.
+function Get-DefaultEngine {
+    $setUp = Test-Path (Join-Path $Root 'build\crw-src\.git')
+    if ($setUp -and (Get-Command docker -ErrorAction SilentlyContinue)) { return 'docker' }
+    return 'local'
+}
+
+# --- Watchdog -------------------------------------------------------------------
+# `start` launches a hidden `crawl.ps1 watch` that checks every $WatchSeconds seconds that
+# the browser, the filter and the engine still answer, and brings back whatever stopped.
+# Without it, a browser that exited or relaunched itself after an update stayed down
+# until someone noticed: the local engine failed JS pages, and the Docker engine quietly
+# rendered everything with Camoufox instead.
+$WatchSeconds  = 30
+$WatchdogNames = @('powershell', 'pwsh')
+$WatchLog      = Join-Path $LogDir 'watchdog.log'
+
+function Write-WatchLog([string]$Message) {
+    Add-Content -Path $WatchLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  $Message"
+}
+
+function Stop-Watchdog {
+    $proc = Get-Tracked 'watchdog' $WatchdogNames
+    if ($proc) {
+        # Not taskkill /T: a browser or filter the watchdog restarted is its child process.
+        Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+        Write-Host "  stopped watchdog (PID $($proc.Id))"
+    }
+    Remove-Item (Get-PidFile 'watchdog') -Force -ErrorAction SilentlyContinue
+}
+
+function Start-Watchdog {
+    Stop-Watchdog
+    $shell = (Get-Process -Id $PID).Path
+    $proc = Start-Process -FilePath $shell -WindowStyle Hidden -PassThru -ArgumentList @(
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"", 'watch')
+    Set-Content -Path (Get-PidFile 'watchdog') -Value $proc.Id -NoNewline
+    Write-Host "  watchdog up  (checks every $WatchSeconds s, brings back anything that stops)"
+}
+
+function Invoke-Watch {
+    New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+    $mode = Get-Content $BrowserModeFile -Raw -ErrorAction SilentlyContinue
+    if ($mode) { $script:Browser = $mode.Trim() }
+    Write-WatchLog "watching the $(Get-RunningEngine) engine (browser $script:Browser)"
+    $apiMisses = 0
+    while ($true) {
+        Start-Sleep -Seconds $WatchSeconds
+        $engine = Get-RunningEngine
+        if (-not $engine) { Write-WatchLog 'crawler stopped; watchdog exiting'; return }
+        # Only the watchdog that the last start launched may act.
+        if ((Get-Content (Get-PidFile 'watchdog') -Raw -ErrorAction SilentlyContinue) -ne "$PID") { return }
+        try {
+            $browserRestarted = $false
+            if (-not (Test-Url "http://127.0.0.1:$ChromePort/json/version")) {
+                Write-WatchLog 'browser not answering on DevTools; restarting it'
+                Start-Browser
+                $browserRestarted = $true
+            }
+            if (-not (Test-Url "http://127.0.0.1:$CdpPort/json/version")) {
+                Write-WatchLog 'filter not answering; restarting it'
+                Stop-Tracked 'cdp-filter' @('cdp-filter')
+                Start-Filter
+            }
+            if (Test-Url "$ApiUrl/health") {
+                $apiMisses = 0
+                # A browser that updated itself has a new User-Agent; hand it to the container.
+                if ($browserRestarted -and $engine -eq 'docker') { Update-DockerEngine }
+            } elseif (++$apiMisses -ge 2) {
+                Write-WatchLog "engine not answering at $ApiUrl/health; restarting it"
+                if ($engine -eq 'docker') {
+                    Update-DockerEngine
+                } else {
+                    Stop-Tracked 'crw-server' @('crw-server')
+                    Start-Crw
+                }
+                $apiMisses = 0
+            }
+        } catch {
+            Write-WatchLog "repair failed: $($_.Exception.Message)"
+        }
+    }
+}
+
 # --- Start / stop / status ------------------------------------------------------
 function Invoke-Start {
     New-Item -ItemType Directory -Force -Path $RunDir, $LogDir | Out-Null
     $engine = $Engine
     if (-not $engine) { $engine = Get-RunningEngine }
-    if (-not $engine) { $engine = 'local' }
+    if (-not $engine) { $engine = Get-DefaultEngine }
     $running = Get-RunningEngine
     if ($running -and $running -ne $engine) { Invoke-Stop }   # switching engines
 
@@ -505,6 +617,7 @@ function Invoke-Start {
         Start-LocalEngine
     }
     Set-Content -Path $EngineFile -Value $engine -NoNewline
+    Start-Watchdog
     Write-Host ""
     Write-Host "Ready. API:  $ApiUrl  (Firecrawl-compatible: /v1/scrape, /v1/crawl, /v1/map)"
     Write-Host "Try:         .\crawl.ps1 scrape https://example.com"
@@ -513,6 +626,8 @@ function Invoke-Start {
 
 function Invoke-Stop {
     Write-Host "Stopping crawler..."
+    # First, so it doesn't bring back what the lines below stop.
+    Stop-Watchdog
     Stop-Tracked 'crw-server' @('crw-server')
     Stop-Tracked 'cdp-filter' @('cdp-filter')
     Stop-Browser
@@ -554,6 +669,13 @@ function Invoke-Status {
     } else {
         Write-Host "filter     : stopped"
     }
+
+    $watchdog = Get-Tracked 'watchdog' $WatchdogNames
+    if ($watchdog) {
+        Write-Host "watchdog   : running, PID $($watchdog.Id), checks every $WatchSeconds s (logs\watchdog.log)"
+    } else {
+        Write-Host "watchdog   : stopped"
+    }
 }
 
 function Invoke-Scrape {
@@ -568,7 +690,7 @@ function Invoke-Scrape {
 }
 
 $LastErrorFile = Join-Path $RunDir 'last-error.txt'
-Remove-Item $LastErrorFile -Force -ErrorAction SilentlyContinue
+if ($Command -ne 'watch') { Remove-Item $LastErrorFile -Force -ErrorAction SilentlyContinue }
 
 try {
     switch ($Command) {
@@ -589,6 +711,7 @@ try {
             }
         }
         'scrape'  { Invoke-Scrape }
+        'watch'   { Invoke-Watch }
     }
 } catch {
     # Saved so the tray app can show why a start or stop failed.

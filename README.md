@@ -74,7 +74,9 @@ Measured with the crawler itself, on Chrome 154 on Windows:
 
 ## Engines: local or Docker
 
-There are two ways to run it. Switch in the tray (**Options → Local engine / Docker engine**) or with `.\crawl.ps1 restart -Engine docker`. Both serve the same API on the same port, so MCP clients and Tailscale don't notice the switch.
+There are two ways to run it. Once `.\setup.ps1 -Docker` has run, the Docker engine is the default, because it has the [scrape fixes](#fixes-on-top-of-fastcrw); otherwise it's the local engine. Switch in the tray (**Options → Local engine / Docker engine**) or with `.\crawl.ps1 restart -Engine local` or `-Engine docker`. Both serve the same API on the same port, so MCP clients and Tailscale don't notice the switch.
+
+Both engines render JavaScript pages with the same Chrome and filter running on Windows, so they're equally reliable. The [watchdog](#the-watchdog) keeps those running.
 
 | | Local engine | Docker engine (hybrid) |
 |---|---|---|
@@ -178,7 +180,13 @@ The source is in `tray\`. After editing it, run `.\tray\install.ps1` again. Use 
 .\crawl.ps1 scrape <url>     # print one page as markdown
 ```
 
-`start.cmd` and `stop.cmd` do the same as `start` and `stop` when double-clicked. Nothing starts at login unless you set that up yourself.
+`start.cmd` and `stop.cmd` do the same as `start` and `stop` when double-clicked. Nothing starts at login unless you set that up yourself. After a reboot the crawler is off, including the Docker engine's containers, until you start it again.
+
+### The watchdog
+
+`start` also launches a hidden watchdog (`crawl.ps1 watch`). Every 30 seconds it checks that Chrome, the filter and the engine still answer, and brings back whatever stopped, usually within half a minute. `.\crawl.ps1 status` shows it, and `logs\watchdog.log` records each repair.
+
+It exists because Chrome can exit, or relaunch itself after an update without the DevTools port crw needs. Before the watchdog, that went unnoticed: the local engine failed JavaScript pages, and the Docker engine quietly rendered everything with Camoufox for days.
 
 ## Using the REST API
 
@@ -333,7 +341,7 @@ The phone needs no Tailscale for this, and the PC must stay awake with the crawl
 
 Choose **Options → Visible window (for debugging)** in the tray, or run `.\crawl.ps1 restart -Browser visible`. Chrome opens on screen, and pages crw renders appear as tabs, so you can watch what a site does.
 
-If you close that window, Chrome exits. JS pages then stop rendering until you click **Restart**. Plain HTML pages still work. The tray turns amber when this happens.
+If you close that window, Chrome exits, and the [watchdog](#the-watchdog) opens it again within about 30 seconds. Until then, JS pages don't render (plain HTML pages still work) and the tray turns amber.
 
 ## Configuration
 
@@ -361,14 +369,15 @@ crw's limit on *incoming* API requests is turned off (`rate_limit_rps = 0`). Its
 | Pages are slow, or fall back to Chrome often | crw's direct HTTP fetch has a hardcoded 2.5 s connect timeout, so a weak Wi-Fi link misses it. Pages still come back via Chrome, just slower. A better connection fixes it. |
 | Garbled characters (`Ã©`, `â€™`) in PowerShell | Windows PowerShell 5.1's `Invoke-RestMethod` decodes this API as Latin-1. Use `curl.exe`, PowerShell 7, or `.\crawl.ps1 scrape`. |
 | "Port … is already used by …" | Another app has the port. Change it at the top of `crawl.ps1`: `$ApiPort` (3002), `$CdpPort` (9223, the filter) or `$ChromePort` (9224, Chrome). For the Docker engine, also change `3002` in `docker\compose.yml`. |
-| Tray icon is amber while running | The browser was closed. Click **Restart**. |
+| Tray icon is amber while running | The browser was closed or crashed. The watchdog restarts it within about 30 seconds; if it stays amber, click **Restart** and check `logs\watchdog.log`. |
+| `renderedWith: "camoufox"` for every page, or `renderDecision` says `"reason": "lightpandaCrash"` | Chrome wasn't reachable, so the Docker engine fell back to Camoufox. crw labels any browser error `lightpandaCrash`, even with LightPanda switched off; the `chain` shows which browsers were really tried. Run `.\crawl.ps1 status`: the watchdog should already be bringing Chrome back. |
 | A page comes back as a short "continue shopping" or "just a moment" page | That's a bot wall the plain HTTP fetch didn't get past. Retry with `"renderJs": true` (Amazon product pages often need this). |
 | A site blocks every request, even ones that used to work | Your IP has been flagged, often after many requests in a short time. Wait a while, then slow down. |
 | `/v1/search` returns 503, or there's no `crw_search` tool | Search needs the Docker engine, which runs SearXNG. |
 | Search returns few, no, or unrelated results | Public search engines rate-limit, CAPTCHA, or block self-hosted SearXNG. In one test, every engine except Bing was blocked, and Bing answered "fastcrw web scraper" with running shoes. Check with `docker exec local-crawl-searxng-1 wget -qO- "http://localhost:8080/search?format=json&q=test"` and look at `unresponsive_engines`. Use your AI client's built-in web search instead. |
 | `json` / `summary` formats or `/v1/extract` fail | They need an LLM API key in `[extraction.llm]`. |
 
-The logs are in `logs\`: `crw-server.log` and `crw-server.err.log` for the local engine's server, `cdp-filter.log` for the filter, and `browser.log` and `browser.out.log` for Chrome. The Docker engine's containers log to Docker; `.\crawl.ps1 logs` follows crw's.
+The logs are in `logs\`: `crw-server.log` and `crw-server.err.log` for the local engine's server, `cdp-filter.log` for the filter, `browser.log` and `browser.out.log` for Chrome, and `watchdog.log` for automatic repairs. The Docker engine's containers log to Docker; `.\crawl.ps1 logs` follows crw's.
 
 ## Project layout
 
