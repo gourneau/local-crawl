@@ -50,10 +50,14 @@ param(
     # Defaults to whichever engine is running (for restart), else docker if it has been
     # set up on this PC, else local.
     [ValidateSet('local', 'docker')]
-    [string]$Engine
+    [string]$Engine,
+
+    # Internal: this run was relaunched outside the caller's job (see Invoke-Detached).
+    [switch]$Detached
 )
 
 $ErrorActionPreference = 'Stop'
+$BrowserGiven = $PSBoundParameters.ContainsKey('Browser')
 
 # --- Settings -----------------------------------------------------------------
 $ApiPort    = 3002   # crw API: http://127.0.0.1:3002 (3000 is left free for dev servers)
@@ -607,6 +611,7 @@ function Invoke-Watch {
             } elseif (++$apiMisses -ge 2) {
                 Write-WatchLog "engine not answering at $ApiUrl/health; restarting it"
                 if ($engine -eq 'docker') {
+                    Start-DockerDesktop   # in case Docker Desktop itself went away
                     Update-DockerEngine
                 } else {
                     Stop-Tracked 'crw-server' @('crw-server')
@@ -711,7 +716,76 @@ function Invoke-Scrape {
 $LastErrorFile = Join-Path $RunDir 'last-error.txt'
 if ($Command -ne 'watch') { Remove-Item $LastErrorFile -Force -ErrorAction SilentlyContinue }
 
-try {
+# --- Detaching from the caller's job ----------------------------------------------
+# Windows ends every process in a job object together when the job closes. Some apps
+# run their commands in one: the Claude desktop app does, so a crawler started from a
+# Claude chat was killed whenever the app restarted or updated (Chrome, the filter, the
+# watchdog and Docker Desktop at once, so the watchdog couldn't help). In that case
+# start/restart re-run themselves through WMI, whose processes belong to no job, and
+# relay that run's output here. From the tray or a normal terminal nothing changes.
+$DetachedLog      = Join-Path $LogDir 'start.log'
+$DetachedExitFile = Join-Path $RunDir 'start.exitcode'
+
+function Test-InJob {
+    if (-not ('CrawlJob' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class CrawlJob {
+    [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32.dll")] static extern bool IsProcessInJob(IntPtr process, IntPtr job, out bool result);
+    public static bool InJob() { bool r; return IsProcessInJob(GetCurrentProcess(), IntPtr.Zero, out r) && r; }
+}
+'@
+    }
+    return [CrawlJob]::InJob()
+}
+
+function Invoke-Detached {
+    New-Item -ItemType Directory -Force -Path $RunDir, $LogDir | Out-Null
+    Remove-Item $DetachedLog, $DetachedExitFile -Force -ErrorAction SilentlyContinue
+    $shell = (Get-Process -Id $PID).Path
+    $cmd = "`"$shell`" -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" $Command -Detached"
+    if ($Engine) { $cmd += " -Engine $Engine" }
+    if ($BrowserGiven) { $cmd += " -Browser $Browser" }
+    $startup = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ ShowWindow = [uint16]0 }
+    $result = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
+        CommandLine = $cmd; CurrentDirectory = $Root; ProcessStartupInformation = $startup
+    }
+    if ($result.ReturnValue -ne 0) {
+        throw "Couldn't start the crawler outside this app's job (WMI error $($result.ReturnValue))."
+    }
+    $shown = 0
+    while ($true) {
+        $running = Get-Process -Id $result.ProcessId -ErrorAction SilentlyContinue
+        $lines = @(Get-Content $DetachedLog -ErrorAction SilentlyContinue)
+        if ($lines.Count -gt $shown) {
+            $lines[$shown..($lines.Count - 1)] | ForEach-Object { Write-Host $_ }
+            $shown = $lines.Count
+        }
+        if (-not $running) { break }
+        Start-Sleep -Milliseconds 300
+    }
+    if ((Get-Content $DetachedExitFile -Raw -ErrorAction SilentlyContinue) -ne '0') {
+        $why = Get-Content $LastErrorFile -Raw -ErrorAction SilentlyContinue
+        if (-not $why) { $why = "see $DetachedLog" }
+        throw "Starting the crawler failed: $($why.Trim())"
+    }
+}
+
+# The relaunched run: nobody sees its hidden console, so its output goes to a file
+# that Invoke-Detached relays, and its result to another.
+function Invoke-AsDetachedChild {
+    $code = 1
+    try {
+        Invoke-Selected *>&1 | ForEach-Object { Add-Content -Path $DetachedLog -Value "$_" }
+        $code = 0
+    } finally {
+        Set-Content -Path $DetachedExitFile -Value $code -NoNewline
+    }
+}
+
+function Invoke-Selected {
     switch ($Command) {
         'start'   { Invoke-Start }
         'stop'    {
@@ -735,6 +809,16 @@ try {
         }
         'scrape'  { Invoke-Scrape }
         'watch'   { Invoke-Watch }
+    }
+}
+
+try {
+    if ($Detached) {
+        Invoke-AsDetachedChild
+    } elseif (($Command -in 'start', 'restart') -and (Test-InJob)) {
+        Invoke-Detached
+    } else {
+        Invoke-Selected
     }
 } catch {
     # Saved so the tray app can show why a start or stop failed.

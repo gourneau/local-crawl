@@ -194,6 +194,8 @@ On the Docker engine, stopping also quits Docker Desktop, so its Linux VM gives 
 
 It exists because Chrome can exit, or relaunch itself after an update without the DevTools port crw needs. Before the watchdog, that went unnoticed: the local engine failed JavaScript pages, and the Docker engine quietly rendered everything with Camoufox for days.
 
+Some apps run the commands they launch inside a Windows job object, and Windows ends a job's processes together when the app closes or updates. The Claude desktop app is one of them: a crawler started from a Claude chat used to die, watchdog and Docker Desktop included, whenever the app restarted. So when `start` or `restart` finds itself inside a job, it re-launches itself through WMI, outside any job, and shows that run's output (also saved to `logs\start.log`). Started from the tray or a normal terminal, nothing changes.
+
 ## Using the REST API
 
 The base URL is `http://127.0.0.1:3002`. No API key is needed locally.
