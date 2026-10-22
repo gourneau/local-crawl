@@ -9,6 +9,15 @@
 rate_limit_rps = 0
 
 [renderer]
+# Several agents scrape at once. Chrome on Windows has plenty of RAM, so render up to
+# 8 pages in parallel (crw's default is 4).
+pool_size = 8
+# A thin page used to wait the full 8 s for an app shell that never comes: plain pages
+# such as example.com or Hacker News took 8.2 s each and filled the pool. 3 s is the
+# budget crw's own benchmark validated, and fast_ready exits as soon as the page has
+# settled (it still never snapshots an empty shell).
+chrome_spa_selector_max_ms = 3000
+chrome_fast_ready = true
 # HTTP first; switch to headless Chrome only when a page looks like a JS app.
 # Force it per request with "renderJs": true.
 mode = "auto"

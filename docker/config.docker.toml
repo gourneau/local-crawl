@@ -13,6 +13,15 @@ auto_extend_deadline_for_ladder = true
 
 [renderer]
 mode = "auto"
+# Several agents scrape at once. Chrome on Windows has plenty of RAM, so render up to
+# 8 pages in parallel (crw's default is 4).
+pool_size = 8
+# A thin page used to wait the full 8 s for an app shell that never comes: plain pages
+# such as example.com or Hacker News took 8.2 s each and filled the pool. 3 s is the
+# budget crw's own benchmark validated, and fast_ready exits as soon as the page has
+# settled (it still never snapshots an empty shell).
+chrome_spa_selector_max_ms = 3000
+chrome_fast_ready = true
 page_timeout_ms = 45000
 http_timeout_ms = 4000
 chrome_timeout_ms = 30000
