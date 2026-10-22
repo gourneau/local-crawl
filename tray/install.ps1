@@ -82,5 +82,9 @@ foreach ($folder in [Environment]::GetFolderPath('Desktop'), [Environment]::GetF
     Write-Host "Shortcut: $path"
 }
 
-Start-Process $Exe
-Write-Host "Started. Look for the globe icon in the system tray."
+# Through WMI, so the tray doesn't belong to the job of whatever ran this script (the
+# Claude desktop app runs commands in a job, and ends the job's processes when it
+# restarts). See "Detaching from the caller's job" in crawl.ps1.
+$started = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = "`"$Exe`""; CurrentDirectory = $Root }
+if ($started.ReturnValue -ne 0) { Start-Process $Exe }
+Write-Host "Started. Look for the globe icon in the system tray (or under the ^ arrow next to the clock)."
